@@ -5,6 +5,7 @@
 #[macro_use]
 mod serial;
 mod arch;
+mod paging;
 mod pmm;
 
 use core::arch::asm;
@@ -51,26 +52,24 @@ unsafe extern "C" fn kmain() -> ! {
     let hhdm = HHDM_REQUEST.get_response().expect("no HHDM from Limine");
     pmm::init(memmap.entries(), hhdm.offset());
 
-    // Test 1: allocate, free, and reallocate. The freed frame should come back.
-    let a = pmm::alloc_frame().expect("out of frames");
-    let b = pmm::alloc_frame().expect("out of frames");
-    kprintln!("pmm: allocated frames {:#x} and {:#x}", a, b);
-    pmm::free_frame(a);
-    let c = pmm::alloc_frame().expect("out of frames");
-    kprintln!("pmm: reallocated {:#x} after free ({})",
-              c, if c == a { "reuse ok" } else { "MISMATCH" });
+    let root = paging::init();
+    paging::self_test(root);
 
-    // Test 2: breakpoint should print a message and return here.
+    // Test 1: a breakpoint should print a message and return here.
     asm!("int3");
     kprintln!("returned from breakpoint, exceptions work");
 
-    // Test 3: this never returns. It should print a double fault report
-    // from the IST stack instead of hanging.
-    double_fault_test()
+    // Test 2: read an unmapped address. Expect a decoded page-fault report.
+    // The handler halts, so this is the last test.
+    kprintln!("testing page fault on unmapped address...");
+    let _ = core::ptr::read_volatile(0xffff_9100_0000_0000u64 as *const u64);
+
+    halt()
 }
 
-/// Corrupt rsp so the CPU cannot push an exception frame. The resulting
-/// exception chain escalates to a double fault, which must use the IST stack.
+/// Re-enable this to test the double-fault stack. It halts, so call it
+/// in place of the page-fault test.
+#[allow(dead_code)]
 fn double_fault_test() -> ! {
     kprintln!("testing double fault on IST stack...");
     unsafe {

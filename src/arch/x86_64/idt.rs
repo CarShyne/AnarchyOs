@@ -3,6 +3,7 @@
 
 use crate::arch::x86_64::gdt::{DescriptorTablePointer, KERNEL_CODE};
 use crate::arch::x86_64::tss;
+use crate::paging;
 use core::arch::asm;
 use core::ptr::addr_of_mut;
 
@@ -103,9 +104,8 @@ extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, error_c
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64) {
     let cr2: u64;
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) };
-    kprintln!("EXCEPTION: page fault (#PF)");
-    kprintln!("  faulting address = {:#018x}", cr2);
-    kprintln!("  error code       = {:#x}", error_code);
+    kprintln!("EXCEPTION: page fault (#PF) at {:#018x}", cr2);
+    paging::describe_page_fault(error_code);
     dump(&frame);
     halt();
 }
