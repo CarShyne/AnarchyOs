@@ -5,15 +5,26 @@
 #[macro_use]
 mod serial;
 mod arch;
+mod pmm;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
 use limine::BaseRevision;
-use limine::request::{RequestsEndMarker, RequestsStartMarker};
+use limine::request::{
+    HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
+};
 
 #[used]
 #[link_section = ".requests"]
 static BASE_REVISION: BaseRevision = BaseRevision::new();
+
+#[used]
+#[link_section = ".requests"]
+static MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+
+#[used]
+#[link_section = ".requests"]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 #[used]
 #[link_section = ".requests_start_marker"]
@@ -36,11 +47,24 @@ unsafe extern "C" fn kmain() -> ! {
     arch::x86_64::init();
     kprintln!("gdt, tss and idt loaded");
 
-    // Test 1: a breakpoint should print a message and return here.
+    let memmap = MEMMAP_REQUEST.get_response().expect("no memory map from Limine");
+    let hhdm = HHDM_REQUEST.get_response().expect("no HHDM from Limine");
+    pmm::init(memmap.entries(), hhdm.offset());
+
+    // Test 1: allocate, free, and reallocate. The freed frame should come back.
+    let a = pmm::alloc_frame().expect("out of frames");
+    let b = pmm::alloc_frame().expect("out of frames");
+    kprintln!("pmm: allocated frames {:#x} and {:#x}", a, b);
+    pmm::free_frame(a);
+    let c = pmm::alloc_frame().expect("out of frames");
+    kprintln!("pmm: reallocated {:#x} after free ({})",
+              c, if c == a { "reuse ok" } else { "MISMATCH" });
+
+    // Test 2: breakpoint should print a message and return here.
     asm!("int3");
     kprintln!("returned from breakpoint, exceptions work");
 
-    // Test 2: this never returns. It should print a double fault report
+    // Test 3: this never returns. It should print a double fault report
     // from the IST stack instead of hanging.
     double_fault_test()
 }

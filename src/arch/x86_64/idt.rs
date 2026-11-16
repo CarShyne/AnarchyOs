@@ -3,7 +3,6 @@
 
 use crate::arch::x86_64::gdt::{DescriptorTablePointer, KERNEL_CODE};
 use crate::arch::x86_64::tss;
-use crate::kprintln;
 use core::arch::asm;
 use core::ptr::addr_of_mut;
 
