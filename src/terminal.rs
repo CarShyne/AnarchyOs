@@ -8,9 +8,9 @@ use alloc::format;
 use alloc::string::String;
 use core::ptr::addr_of_mut;
 
-const COLS: usize = 38;
-const ROWS: usize = 64;
-const INPUT_MAX: usize = 36;
+const COLS: usize = 120;
+const ROWS: usize = 128;
+const INPUT_MAX: usize = 100;
 const LINE_H: u32 = 18;
 const SCALE: u32 = 2;
 const TEXT: u32 = 0x00C8_D3E0;

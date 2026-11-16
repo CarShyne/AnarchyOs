@@ -26,7 +26,7 @@ iso: kernel
 
 run: iso
 	qemu-system-x86_64 -M q35 -m 512M -cdrom $(ISO) \
-		-serial stdio -no-reboot -no-shutdown
+		-display cocoa,zoom-to-fit=on -serial stdio -no-reboot -no-shutdown
 
 clean:
 	cargo clean

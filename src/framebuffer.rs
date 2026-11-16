@@ -229,3 +229,16 @@ pub fn scroll_up(rows: u32, color: u32) {
     }
     fill_rect(0, h - rows, width(), rows, color);
 }
+
+/// The current clip rectangle as (x0, y0, x1, y1).
+pub fn current_clip() -> (u32, u32, u32, u32) {
+    clip()
+}
+
+/// Restore a clip rectangle returned by `current_clip`.
+pub fn restore_clip(c: (u32, u32, u32, u32)) {
+    CLIP_X0.store(c.0, Ordering::Relaxed);
+    CLIP_Y0.store(c.1, Ordering::Relaxed);
+    CLIP_X1.store(c.2, Ordering::Relaxed);
+    CLIP_Y1.store(c.3, Ordering::Relaxed);
+}

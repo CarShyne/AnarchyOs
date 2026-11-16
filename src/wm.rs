@@ -1,7 +1,7 @@
-//! Window manager. Windows are rounded rectangles with a title bar, kept in
-//! a back-to-front order. Any change repaints the damaged rectangle from the
-//! background up, so nothing leaves trails. Keyboard input goes to the
-//! focused window, which is the one on top.
+//! Window manager. Windows are rounded rectangles with a title bar and a
+//! resize grip in the bottom-right corner. Windows stay in back-to-front
+//! order, and any change repaints the damaged rectangle from the background
+//! up. Keyboard input goes to the focused window, which is the one on top.
 
 use crate::framebuffer as fb;
 use crate::ps2;
@@ -56,6 +56,10 @@ struct Window {
 const MAX_WINDOWS: usize = 3;
 const TITLE_H: u32 = 30;
 const RADIUS: u32 = 14;
+const MIN_W: u32 = 260;
+const MIN_H: u32 = 160;
+/// Size of the square resize grip in the bottom-right corner.
+const GRIP: u32 = 18;
 
 struct State {
     windows: [Window; MAX_WINDOWS],
@@ -67,13 +71,15 @@ struct State {
     left: bool,
     /// Window being dragged, with the pointer's offset inside it.
     drag: Option<(usize, u32, u32)>,
+    /// Window being resized.
+    resizing: Option<usize>,
 }
 
 static mut STATE: State = State {
     windows: [
-        Window { rect: Rect::new(120, 110, 560, 320), title: "Welcome", kind: Kind::Welcome },
-        Window { rect: Rect::new(560, 150, 420, 200), title: "Keys", kind: Kind::Keys },
-        Window { rect: Rect::new(60, 440, 640, 240), title: "Terminal", kind: Kind::Terminal },
+        Window { rect: Rect::new(80, 100, 560, 320), title: "Welcome", kind: Kind::Welcome },
+        Window { rect: Rect::new(680, 140, 480, 240), title: "Keys", kind: Kind::Keys },
+        Window { rect: Rect::new(60, 420, 760, 340), title: "Terminal", kind: Kind::Terminal },
     ],
     order: [0, 1, 2],
     count: 3,
@@ -81,6 +87,7 @@ static mut STATE: State = State {
     cur_y: 0,
     left: false,
     drag: None,
+    resizing: None,
 };
 
 // Only the interrupt path and init touch this, and interrupts don't nest.
@@ -117,13 +124,25 @@ pub fn pointer(x: u32, y: u32, left: bool) {
             let old = s.windows[idx].rect;
             let max_x = fb::width() as i32 - old.w as i32;
             let max_y = fb::height() as i32 - old.h as i32;
-            let nx = clamp(x as i32 - off_x as i32, 0, max_x);
-            let ny = clamp(y as i32 - off_y as i32, 0, max_y);
-            s.windows[idx].rect.x = nx;
-            s.windows[idx].rect.y = ny;
+            s.windows[idx].rect.x = clamp(x as i32 - off_x as i32, 0, max_x);
+            s.windows[idx].rect.y = clamp(y as i32 - off_y as i32, 0, max_y);
             damage = damage.union(old).union(s.windows[idx].rect);
         } else {
             s.drag = None;
+        }
+    } else if let Some(idx) = s.resizing {
+        if left {
+            let old = s.windows[idx].rect;
+            // The grip follows the pointer, so the corner sits under it.
+            let want_w = x as i32 - old.x as i32 + (GRIP / 2) as i32;
+            let want_h = y as i32 - old.y as i32 + (GRIP / 2) as i32;
+            let max_w = fb::width() as i32 - old.x as i32;
+            let max_h = fb::height() as i32 - old.y as i32;
+            s.windows[idx].rect.w = clamp(want_w, MIN_W as i32, max_w.max(MIN_W as i32));
+            s.windows[idx].rect.h = clamp(want_h, MIN_H as i32, max_h.max(MIN_H as i32));
+            damage = damage.union(old).union(s.windows[idx].rect);
+        } else {
+            s.resizing = None;
         }
     } else if pressed {
         if let Some(pos) = hit_test(s, x, y) {
@@ -134,7 +153,9 @@ pub fn pointer(x: u32, y: u32, left: bool) {
                 remove_at(s, pos);
             } else {
                 raise(s, pos);
-                if y < rect.y + TITLE_H {
+                if grip_hit(rect, x, y) {
+                    s.resizing = Some(idx);
+                } else if y < rect.y + TITLE_H {
                     s.drag = Some((idx, x - rect.x, y - rect.y));
                 }
             }
@@ -174,6 +195,13 @@ fn close_center(rect: Rect) -> (u32, u32) {
 fn close_hit(rect: Rect, x: u32, y: u32) -> bool {
     let (cx, cy) = close_center(rect);
     (x as i32 - cx as i32).abs() <= 8 && (y as i32 - cy as i32).abs() <= 8
+}
+
+fn grip_hit(rect: Rect, x: u32, y: u32) -> bool {
+    x >= rect.x + rect.w - GRIP
+        && x < rect.x + rect.w
+        && y >= rect.y + rect.h - GRIP
+        && y < rect.y + rect.h
 }
 
 /// Position in `order` of the topmost window under the pointer.
@@ -218,8 +246,20 @@ fn render(s: &State, r: Rect) {
 
 fn draw_window(win: &Window, focused: bool) {
     let Rect { x, y, w, h } = win.rect;
-    let title_color = if focused { 0x002C_3646 } else { 0x0021_2A38 };
 
+    // Clip the window's contents to its own frame, so long lines and
+    // large content never spill onto neighbouring windows.
+    let prev = fb::current_clip();
+    let x0 = x.max(prev.0);
+    let y0 = y.max(prev.1);
+    let x1 = (x + w).min(prev.2);
+    let y1 = (y + h).min(prev.3);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    fb::set_clip(x0, y0, x1 - x0, y1 - y0);
+
+    let title_color = if focused { 0x002C_3646 } else { 0x0021_2A38 };
     fb::fill_rounded_rect(x, y, w, h, RADIUS, 0x0014_1A28);
     fb::fill_rounded_rect(x, y, w, TITLE_H, RADIUS, title_color);
     // Square off the bottom of the title bar so it meets the body cleanly.
@@ -234,6 +274,20 @@ fn draw_window(win: &Window, focused: bool) {
         Kind::Keys => keys_content(win.rect),
         Kind::Terminal => terminal::draw(x, y, w, h),
     }
+
+    draw_grip(win.rect, focused);
+    fb::restore_clip(prev);
+}
+
+/// Three diagonal dots in the bottom-right corner, the resize affordance.
+fn draw_grip(rect: Rect, focused: bool) {
+    let color = if focused { 0x008A_96A8 } else { 0x0045_4F60 };
+    let Rect { x, y, w, h } = rect;
+    for i in 1..=3u32 {
+        let d = i * 5;
+        fb::fill_rect(x + w - d, y + h - 4, 2, 2, color);
+        fb::fill_rect(x + w - 4, y + h - d, 2, 2, color);
+    }
 }
 
 fn welcome_content(r: Rect) {
@@ -241,7 +295,7 @@ fn welcome_content(r: Rect) {
     let y = r.y + TITLE_H + 28;
     fb::draw_text(x, y, "AnarchyOS", 0x00E6_ECF5, 5);
     fb::draw_text(x, y + 60, "A clean, fun kernel and desktop", 0x0095_A3B8, 2);
-    fb::draw_text(x, y + 110, "Drag this window by its title bar.", 0x00C8_D3E0, 2);
+    fb::draw_text(x, y + 110, "Drag by the title bar. Resize from the corner.", 0x00C8_D3E0, 2);
     fb::draw_text(x, y + 140, "Click any window to bring it forward.", 0x00C8_D3E0, 2);
 }
 
