@@ -1,0 +1,14 @@
+[package]
+name = "anarchy-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+limine = "0.5"   # verify this matches the Limine protocol revision you install
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
