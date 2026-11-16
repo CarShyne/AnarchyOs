@@ -14,6 +14,7 @@ mod heap;
 mod paging;
 mod pic;
 mod pmm;
+mod pit;
 mod ps2;
 mod scene;
 mod terminal;
@@ -129,6 +130,7 @@ unsafe extern "C" fn kmain() -> ! {
     console::disable();
     wm::init();
     ps2::init();
+    pit::init();
     asm!("sti", options(nomem, nostack));
     kprintln!("window manager ready: drag windows by their title bars");
 

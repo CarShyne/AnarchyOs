@@ -1,12 +1,10 @@
-//! Terminal app: a line-based shell inside a window. Output is kept in a
-//! small table of lines, and input is one editable line at the bottom.
-//! Commands run when Enter is pressed.
-
 use crate::framebuffer as fb;
 use crate::heap;
+use crate::pit;
 use alloc::format;
 use alloc::string::String;
 use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 const COLS: usize = 120;
 const ROWS: usize = 128;
@@ -15,6 +13,8 @@ const LINE_H: u32 = 18;
 const SCALE: u32 = 2;
 const TEXT: u32 = 0x00C8_D3E0;
 const ACCENT: u32 = 0x0070_D694;
+
+static BLINK_ON: AtomicBool = AtomicBool::new(true);
 
 struct Term {
     lines: [[u8; COLS]; ROWS],
@@ -32,7 +32,6 @@ static mut TERM: Term = Term {
     input_len: 0,
 };
 
-// Only the interrupt path and init touch this, and interrupts don't nest.
 fn term() -> &'static mut Term {
     unsafe { &mut *addr_of_mut!(TERM) }
 }
@@ -41,8 +40,11 @@ pub fn init() {
     print("AnarchyOS terminal. Type help.");
 }
 
-/// Append a line. Long lines are cut to the column width, and the oldest
-/// line is dropped when the table is full.
+pub fn toggle_blink() {
+    let on = BLINK_ON.load(Ordering::Relaxed);
+    BLINK_ON.store(!on, Ordering::Relaxed);
+}
+
 fn print(text: &str) {
     let t = term();
     if t.count == ROWS {
@@ -60,8 +62,8 @@ fn print(text: &str) {
     t.count += 1;
 }
 
-/// Handle one decoded key. Enter runs the typed command.
 pub fn key(c: u8) {
+    BLINK_ON.store(true, Ordering::Relaxed);
     match c {
         b'\n' => {
             let cmd = take_input();
@@ -98,7 +100,7 @@ fn run(cmd: &str) {
     let rest = parts.next().unwrap_or("");
     match name {
         "" => {}
-        "help" => print("commands: help, about, mem, echo, clear"),
+        "help" => print("commands: help, about, mem, uptime, echo, clear"),
         "about" => {
             print("AnarchyOS v0.1.0");
             print("A clean, fun kernel and desktop.");
@@ -107,14 +109,16 @@ fn run(cmd: &str) {
             let free = heap::free_bytes() / 1024;
             print(&format!("heap free: {} KiB", free));
         }
+        "uptime" => {
+            let secs = pit::ticks() / pit::HZ;
+            print(&format!("up {} s", secs));
+        }
         "echo" => print(rest),
         "clear" => term().count = 0,
         other => print(&format!("unknown command: {}", other)),
     }
 }
 
-/// Draw the output and the prompt inside a window body. The window frame
-/// and background are already drawn, and the clip is set to the window.
 pub fn draw(x: u32, y: u32, w: u32, h: u32) {
     let t = term();
     let top = y + 40;
@@ -132,6 +136,8 @@ pub fn draw(x: u32, y: u32, w: u32, h: u32) {
     let input = core::str::from_utf8(&t.input[..t.input_len]).unwrap_or("");
     fb::draw_text(x + 16, prompt_y, "> ", ACCENT, SCALE);
     fb::draw_text(x + 48, prompt_y, input, TEXT, SCALE);
-    let cursor_x = x + 48 + t.input_len as u32 * 16;
-    fb::fill_rect(cursor_x, prompt_y, 8, 14, ACCENT);
+    if BLINK_ON.load(Ordering::Relaxed) {
+        let cursor_x = x + 48 + t.input_len as u32 * 16;
+        fb::fill_rect(cursor_x, prompt_y, 8, 14, ACCENT);
+    }
 }

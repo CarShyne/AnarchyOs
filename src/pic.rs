@@ -31,7 +31,7 @@ pub fn remap() {
         outb(PIC2_DATA, 0x01);
         // Masks: a 0 bit means enabled.
         // Master: keyboard (IRQ1) and cascade (IRQ2) enabled, timer masked.
-        outb(PIC1_DATA, 0b1111_1001);
+        outb(PIC1_DATA, 0b1111_1000);
         // Slave: mouse (IRQ12 = slave bit 4) enabled, everything else masked.
         outb(PIC2_DATA, 0b1110_1111);
     }

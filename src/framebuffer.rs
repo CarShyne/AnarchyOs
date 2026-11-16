@@ -242,3 +242,19 @@ pub fn restore_clip(c: (u32, u32, u32, u32)) {
     CLIP_X1.store(c.2, Ordering::Relaxed);
     CLIP_Y1.store(c.3, Ordering::Relaxed);
 }
+
+/// Like fill_rounded_rect, but blends over what is already on screen.
+pub fn blend_rounded_rect(x: u32, y: u32, w: u32, h: u32, r: u32, color: u32, alpha: u32) {
+    let r = r.min(w / 2).min(h / 2);
+    for row in 0..h {
+        let inset = if row < r {
+            corner_inset(r, row)
+        } else if row >= h - r {
+            corner_inset(r, h - 1 - row)
+        } else {
+            0
+        };
+        blend_rect(x + inset, y + row, w - 2 * inset, 1, color, alpha);
+    }
+}
+
