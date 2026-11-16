@@ -1,12 +1,8 @@
-//! Window manager. A translucent top bar lists open windows and shows the
-//! clock. A translucent dock at the bottom opens and closes apps. Opacity
-//! for both comes from sliders in the Settings window. Any change repaints
-//! the damaged rectangle from the wallpaper up, so nothing leaves trails.
-
 use crate::framebuffer as fb;
 use crate::pit;
 use crate::ps2;
 use crate::scene;
+use crate::settings;
 use crate::terminal;
 use alloc::format;
 use core::ptr::addr_of_mut;
@@ -52,9 +48,11 @@ pub enum Kind {
 #[derive(Clone, Copy)]
 struct Window {
     rect: Rect,
+    saved: Rect,
     title: &'static str,
     kind: Kind,
     open: bool,
+    full: bool,
 }
 
 const MAX_WINDOWS: usize = 4;
@@ -66,8 +64,8 @@ const MIN_H: u32 = 160;
 const GRIP: u32 = 18;
 
 const TOP_H: u32 = 40;
-const BTN_X0: u32 = 170;
 const BTN_Y: u32 = 6;
+const BTN_X0: u32 = 170;
 const BTN_W: u32 = 140;
 const BTN_H: u32 = 28;
 const BTN_GAP: u32 = 8;
@@ -82,33 +80,27 @@ const DOCK_COLORS: [u32; MAX_WINDOWS] = [0x005B_8CFF, 0x0070_D694, 0x00FF_B86B, 
 const ACCENT: u32 = 0x005B_8CFF;
 const TEXT: u32 = 0x00E6_ECF5;
 const MUTED: u32 = 0x0095_A3B8;
-/// Timer ticks between cursor blinks: 50 ticks at 100 Hz is 500 ms.
 const BLINK_TICKS: u64 = 50;
 
 struct State {
     windows: [Window; MAX_WINDOWS],
-    /// Indices of open windows, back to front. The last entry is focused.
     order: [usize; MAX_WINDOWS],
     count: usize,
     cur_x: u32,
     cur_y: u32,
     left: bool,
-    /// Window being dragged, with the pointer's offset inside it.
     drag: Option<(usize, u32, u32)>,
-    /// Window being resized.
     resizing: Option<usize>,
-    /// Opacity percentages: [top bar, dock].
     opacity: [u32; SLIDERS],
-    /// Slider being dragged, if any.
     slider: Option<usize>,
 }
 
 static mut STATE: State = State {
     windows: [
-        Window { rect: Rect::new(80, 100, 560, 320), title: "Welcome", kind: Kind::Welcome, open: true },
-        Window { rect: Rect::new(680, 140, 480, 240), title: "Keys", kind: Kind::Keys, open: true },
-        Window { rect: Rect::new(60, 360, 760, 320), title: "Terminal", kind: Kind::Terminal, open: true },
-        Window { rect: Rect::new(420, 160, 440, 220), title: "Settings", kind: Kind::Settings, open: false },
+        Window { rect: Rect::new(80, 100, 560, 320), saved: Rect::new(80, 100, 560, 320), title: "Welcome", kind: Kind::Welcome, open: true, full: false },
+        Window { rect: Rect::new(680, 140, 480, 240), saved: Rect::new(680, 140, 480, 240), title: "Keys", kind: Kind::Keys, open: true, full: false },
+        Window { rect: Rect::new(60, 360, 760, 320), saved: Rect::new(60, 360, 760, 320), title: "Terminal", kind: Kind::Terminal, open: true, full: false },
+        Window { rect: Rect::new(420, 160, 440, 220), saved: Rect::new(420, 160, 440, 220), title: "Settings", kind: Kind::Settings, open: false, full: false },
     ],
     order: [0, 1, 2, 3],
     count: 3,
@@ -121,7 +113,6 @@ static mut STATE: State = State {
     slider: None,
 };
 
-// Only interrupt handlers and init touch this, and interrupts don't nest.
 fn state() -> &'static mut State {
     unsafe { &mut *addr_of_mut!(STATE) }
 }
@@ -130,9 +121,10 @@ pub fn init() {
     scene::init();
     terminal::init();
     let s = state();
+    s.opacity = settings::opacity();
     s.cur_x = fb::width() / 2;
     s.cur_y = fb::height() / 2;
-    render(s, Rect::new(0, 0, fb::width(), fb::height()));
+    render(s, full_damage());
 }
 
 pub fn cursor() -> (u32, u32) {
@@ -140,7 +132,6 @@ pub fn cursor() -> (u32, u32) {
     (s.cur_x, s.cur_y)
 }
 
-/// Called from the timer interrupt, 100 times a second.
 pub fn tick(t: u64) {
     if t % BLINK_TICKS != 0 {
         return;
@@ -148,14 +139,12 @@ pub fn tick(t: u64) {
     terminal::toggle_blink();
     let s = state();
     let ti = index_of(s, Kind::Terminal);
-    if s.windows[ti].open {
+    if visible(s, ti).is_some() {
         render(s, s.windows[ti].rect);
     }
     render(s, top_rect());
 }
 
-/// Called for every pointer update: new position and whether the left
-/// button is held.
 pub fn pointer(x: u32, y: u32, left: bool) {
     let s = state();
     let mut damage = cursor_rect(s.cur_x, s.cur_y).union(cursor_rect(x, y));
@@ -171,7 +160,7 @@ pub fn pointer(x: u32, y: u32, left: bool) {
             set_opacity(s, i, x, slider_track(rect, i));
             damage = damage.union(rect).union(top_rect()).union(dock_rect());
         } else {
-            s.slider = None;
+            persist_slider(s);
         }
     } else if let Some((idx, off_x, off_y)) = s.drag {
         if left {
@@ -179,7 +168,6 @@ pub fn pointer(x: u32, y: u32, left: bool) {
             let max_x = fb::width() as i32 - old.w as i32;
             let max_y = fb::height() as i32 - old.h as i32;
             s.windows[idx].rect.x = clamp(x as i32 - off_x as i32, 0, max_x);
-            // Keep the title bar below the top bar so it stays grabbable.
             s.windows[idx].rect.y = clamp(y as i32 - off_y as i32, TOP_H as i32, max_y.max(TOP_H as i32));
             damage = damage.union(old).union(s.windows[idx].rect);
         } else {
@@ -188,7 +176,6 @@ pub fn pointer(x: u32, y: u32, left: bool) {
     } else if let Some(idx) = s.resizing {
         if left {
             let old = s.windows[idx].rect;
-            // The grip follows the pointer, so the corner sits under it.
             let want_w = x as i32 - old.x as i32 + (GRIP / 2) as i32;
             let want_h = y as i32 - old.y as i32 + (GRIP / 2) as i32;
             let max_w = fb::width() as i32 - old.x as i32;
@@ -202,18 +189,27 @@ pub fn pointer(x: u32, y: u32, left: bool) {
     } else if pressed {
         if y < TOP_H {
             if let Some(i) = top_button_at(x, y) {
-                toggle(s, i);
-                damage = damage.union(top_rect()).union(s.windows[i].rect);
+                dock_click(s, i);
+                damage = full_damage();
             }
+        } else if let Some(i) = dock_tile_at(x, y) {
+            dock_click(s, i);
+            damage = full_damage();
         } else if let Some(pos) = hit_test(s, x, y) {
             let idx = s.order[pos];
             let rect = s.windows[idx].rect;
-            damage = damage.union(rect);
-            if close_hit(rect, x, y) {
-                remove_at(s, pos);
-                s.windows[idx].open = false;
+            if y < rect.y + TITLE_H && dot_hit(rect, x, y, 0) {
+                close(s, idx);
+                damage = full_damage();
+            } else if y < rect.y + TITLE_H && dot_hit(rect, x, y, 1) {
+                hide(s, idx);
+                damage = full_damage();
+            } else if y < rect.y + TITLE_H && dot_hit(rect, x, y, 2) {
+                toggle_full(s, idx);
+                damage = full_damage();
             } else {
                 raise(s, pos);
+                damage = damage.union(rect);
                 if s.windows[idx].kind == Kind::Settings {
                     if let Some(i) = slider_hit(rect, x, y) {
                         s.slider = Some(i);
@@ -221,7 +217,7 @@ pub fn pointer(x: u32, y: u32, left: bool) {
                         damage = damage.union(top_rect()).union(dock_rect());
                     }
                 }
-                if s.slider.is_none() {
+                if s.slider.is_none() && !s.windows[idx].full {
                     if grip_hit(rect, x, y) {
                         s.resizing = Some(idx);
                     } else if y < rect.y + TITLE_H {
@@ -229,16 +225,12 @@ pub fn pointer(x: u32, y: u32, left: bool) {
                     }
                 }
             }
-        } else if let Some(i) = dock_tile_at(x, y) {
-            toggle(s, i);
-            damage = damage.union(dock_rect()).union(s.windows[i].rect);
         }
     }
 
     render(s, damage);
 }
 
-/// Route one decoded key to the focused window, then repaint it.
 pub fn key(c: u8) {
     let s = state();
     if s.count == 0 {
@@ -250,6 +242,7 @@ pub fn key(c: u8) {
         Kind::Terminal => terminal::key(c),
         Kind::Welcome | Kind::Settings => return,
     }
+    s.opacity = settings::opacity();
     render(s, s.windows[idx].rect);
 }
 
@@ -259,6 +252,14 @@ fn clamp(v: i32, lo: i32, hi: i32) -> u32 {
 
 fn index_of(s: &State, kind: Kind) -> usize {
     (0..MAX_WINDOWS).find(|&i| s.windows[i].kind == kind).unwrap_or(0)
+}
+
+fn visible(s: &State, idx: usize) -> Option<usize> {
+    (0..s.count).find(|&p| s.order[p] == idx)
+}
+
+fn full_damage() -> Rect {
+    Rect::new(0, 0, fb::width(), fb::height())
 }
 
 fn alpha_of(percent: u32) -> u32 {
@@ -309,7 +310,6 @@ fn dock_tile_at(x: u32, y: u32) -> Option<usize> {
     })
 }
 
-/// Track rectangle for slider `i` inside the Settings window.
 fn slider_track(r: Rect, i: usize) -> Rect {
     Rect::new(r.x + 24, r.y + TITLE_H + 24 + i as u32 * 80 + 34, r.w - 48, 6)
 }
@@ -330,12 +330,12 @@ fn cursor_rect(x: u32, y: u32) -> Rect {
     Rect::new(x, y, 8, 12)
 }
 
-fn close_center(rect: Rect) -> (u32, u32) {
-    (rect.x + 18, rect.y + 15)
+fn dot_center(rect: Rect, n: u32) -> (u32, u32) {
+    (rect.x + 18 + n * 20, rect.y + 15)
 }
 
-fn close_hit(rect: Rect, x: u32, y: u32) -> bool {
-    let (cx, cy) = close_center(rect);
+fn dot_hit(rect: Rect, x: u32, y: u32, n: u32) -> bool {
+    let (cx, cy) = dot_center(rect, n);
     (x as i32 - cx as i32).abs() <= 8 && (y as i32 - cy as i32).abs() <= 8
 }
 
@@ -346,27 +346,47 @@ fn grip_hit(rect: Rect, x: u32, y: u32) -> bool {
         && y < rect.y + rect.h
 }
 
-/// Position in `order` of the topmost window under the pointer.
 fn hit_test(s: &State, x: u32, y: u32) -> Option<usize> {
     (0..s.count).rev().find(|&pos| s.windows[s.order[pos]].rect.contains(x, y))
 }
 
-/// Taskbar-style behaviour, shared by the top bar and dock: a closed window
-/// opens on top, a background window is raised, and the focused window is
-/// closed.
-fn toggle(s: &mut State, idx: usize) {
-    if !s.windows[idx].open {
-        s.windows[idx].open = true;
-        s.order[s.count] = idx;
-        s.count += 1;
-        return;
+fn dock_click(s: &mut State, idx: usize) {
+    match visible(s, idx) {
+        None => {
+            s.windows[idx].open = true;
+            s.order[s.count] = idx;
+            s.count += 1;
+        }
+        Some(p) if p + 1 == s.count => hide(s, idx),
+        Some(p) => raise(s, p),
     }
-    let pos = (0..s.count).find(|&p| s.order[p] == idx).unwrap_or(0);
-    if pos == s.count - 1 {
-        remove_at(s, pos);
-        s.windows[idx].open = false;
+}
+
+fn hide(s: &mut State, idx: usize) {
+    if let Some(p) = visible(s, idx) {
+        remove_at(s, p);
+    }
+}
+
+fn close(s: &mut State, idx: usize) {
+    hide(s, idx);
+    let w = &mut s.windows[idx];
+    w.open = false;
+    if w.full {
+        w.rect = w.saved;
+        w.full = false;
+    }
+}
+
+fn toggle_full(s: &mut State, idx: usize) {
+    let w = &mut s.windows[idx];
+    if w.full {
+        w.rect = w.saved;
+        w.full = false;
     } else {
-        raise(s, pos);
+        w.saved = w.rect;
+        w.rect = Rect::new(0, TOP_H, fb::width(), fb::height() - TOP_H);
+        w.full = true;
     }
 }
 
@@ -385,12 +405,9 @@ fn raise(s: &mut State, pos: usize) {
     s.order[s.count - 1] = idx;
 }
 
-/// Repaint one damaged rectangle: wallpaper, dock, open windows back to
-/// front, top bar, then the pointer. Everything is clipped to `r`.
 fn render(s: &State, r: Rect) {
     fb::set_clip(r.x, r.y, r.w, r.h);
     scene::draw_background();
-    draw_dock(s);
 
     let focused = s.count.saturating_sub(1);
     for pos in 0..s.count {
@@ -400,13 +417,13 @@ fn render(s: &State, r: Rect) {
         }
     }
 
+    draw_dock(s);
     draw_topbar(s);
     draw_cursor(s.cur_x, s.cur_y);
     fb::reset_clip();
     fb::present(r.x, r.y, r.w, r.h);
 }
 
-/// Translucent dock with one tile per app. A dot under a tile means open.
 fn draw_dock(s: &State) {
     let d = dock_rect();
     fb::blend_rounded_rect(d.x, d.y, d.w, d.h, 22, 0x0021_2A38, alpha_of(s.opacity[1]));
@@ -417,12 +434,11 @@ fn draw_dock(s: &State) {
         fb::fill_rounded_rect(tx, ty, TILE, TILE, 12, DOCK_COLORS[i]);
         fb::draw_text(tx + (TILE - 24) / 2, ty + (TILE - 24) / 2, &win.title[..1], 0x00FF_FFFF, 3);
         if win.open {
-            fb::fill_rect(tx + TILE / 2 - 2, d.y + DOCK_H - 6, 4, 4, TEXT);
+            fb::fill_rounded_rect(tx + TILE / 2 - 3, d.y + DOCK_H - 8, 6, 6, 3, TEXT);
         }
     }
 }
 
-/// Translucent top bar: brand, one button per window, and the uptime clock.
 fn draw_topbar(s: &State) {
     let w = fb::width();
     fb::blend_rect(0, 0, w, TOP_H, 0x0030_3A4E, alpha_of(s.opacity[0]));
@@ -434,8 +450,10 @@ fn draw_topbar(s: &State) {
         let bx = btn_x(i);
         let color = if Some(i) == focused {
             ACCENT
-        } else if win.open {
+        } else if visible(s, i).is_some() {
             0x0034_3F52
+        } else if win.open {
+            0x0026_2E3E
         } else {
             0x0018_1E2A
         };
@@ -461,8 +479,6 @@ fn two_digits(buf: &mut [u8], at: usize, n: u64) {
 fn draw_window(win: &Window, focused: bool, opacity: [u32; SLIDERS]) {
     let Rect { x, y, w, h } = win.rect;
 
-    // Clip the window's contents to its own frame, so long lines and
-    // large content never spill onto neighbouring windows.
     let prev = fb::current_clip();
     let x0 = x.max(prev.0);
     let y0 = y.max(prev.1);
@@ -476,12 +492,14 @@ fn draw_window(win: &Window, focused: bool, opacity: [u32; SLIDERS]) {
     let title_color = if focused { 0x002C_3646 } else { 0x0021_2A38 };
     fb::fill_rounded_rect(x, y, w, h, RADIUS, 0x0014_1A28);
     fb::fill_rounded_rect(x, y, w, TITLE_H, RADIUS, title_color);
-    // Square off the bottom of the title bar so it meets the body cleanly.
     fb::fill_rect(x, y + RADIUS, w, TITLE_H - RADIUS, title_color);
 
-    let (cx, cy) = close_center(win.rect);
-    fb::fill_rounded_rect(cx - 6, cy - 6, 12, 12, 6, 0x00FF_5F57);
-    fb::draw_text(x + 36, y + 7, win.title, TEXT, 2);
+    let dot_colors = [0x00FF_5F57, 0x00FE_BC2E, 0x0028_C840];
+    for n in 0..3u32 {
+        let (cx, cy) = dot_center(win.rect, n);
+        fb::fill_rounded_rect(cx - 6, cy - 6, 12, 12, 6, dot_colors[n as usize]);
+    }
+    fb::draw_text(x + 80, y + 7, win.title, TEXT, 2);
 
     match win.kind {
         Kind::Welcome => welcome_content(win.rect),
@@ -490,11 +508,12 @@ fn draw_window(win: &Window, focused: bool, opacity: [u32; SLIDERS]) {
         Kind::Settings => settings_content(win.rect, opacity),
     }
 
-    draw_grip(win.rect, focused);
+    if !win.full {
+        draw_grip(win.rect, focused);
+    }
     fb::restore_clip(prev);
 }
 
-/// Two sliders, one for the top bar and one for the dock.
 fn settings_content(r: Rect, opacity: [u32; SLIDERS]) {
     let labels = ["Top bar opacity", "Dock opacity"];
     for i in 0..SLIDERS {
@@ -519,8 +538,9 @@ fn welcome_content(r: Rect) {
     let y = r.y + TITLE_H + 28;
     fb::draw_text(x, y, "AnarchyOS", TEXT, 5);
     fb::draw_text(x, y + 60, "A clean, fun kernel and desktop", MUTED, 2);
-    fb::draw_text(x, y + 110, "Drag by the title bar. Resize from the corner.", 0x00C8_D3E0, 2);
-    fb::draw_text(x, y + 140, "The dock opens apps. The top bar lists open windows.", 0x00C8_D3E0, 2);
+    fb::draw_text(x, y + 110, "Red: quit the app.", 0x00C8_D3E0, 2);
+    fb::draw_text(x, y + 140, "Yellow: send to dock.", 0x00C8_D3E0, 2);
+    fb::draw_text(x, y + 170, "Green: fullscreen.", 0x00C8_D3E0, 2);
 }
 
 fn keys_content(r: Rect) {
@@ -530,7 +550,6 @@ fn keys_content(r: Rect) {
 
     let mut buf = [0u8; ps2::TYPED_MAX];
     let n = ps2::copy_typed(&mut buf);
-    // Show the most recent characters that fit in the window.
     let max_chars = (r.w.saturating_sub(60) / 16) as usize;
     let start = n.saturating_sub(max_chars);
     let text = core::str::from_utf8(&buf[start..n]).unwrap_or("");
@@ -538,7 +557,6 @@ fn keys_content(r: Rect) {
     fb::draw_text(x + 32, y + 40, text, TEXT, 2);
 }
 
-/// Three diagonal dots in the bottom-right corner, the resize affordance.
 fn draw_grip(rect: Rect, focused: bool) {
     let color = if focused { 0x008A_96A8 } else { 0x0045_4F60 };
     let Rect { x, y, w, h } = rect;
@@ -554,6 +572,22 @@ fn draw_cursor(x: u32, y: u32) {
         let width = (row + 1).min(7);
         for col in 0..width {
             fb::put_pixel(x + col, y + row, 0x00FF_FFFF);
+        }
+    }
+}
+
+pub fn mouse(dx: i32, dy: i32, left: bool) {
+    let s = state();
+    let x = clamp(s.cur_x as i32 + dx, 0, fb::width() as i32 - 1);
+    let y = clamp(s.cur_y as i32 - dy, 0, fb::height() as i32 - 1);
+    pointer(x, y, left);
+}
+
+fn persist_slider(s: &mut State) {
+    if let Some(i) = s.slider.take() {
+        settings::set(settings::OPACITY_KEYS[i], &format!("{}", s.opacity[i]));
+        if let Err(e) = settings::flush() {
+            kprintln!("settings: save failed: {}", e);
         }
     }
 }

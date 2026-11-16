@@ -1,6 +1,7 @@
 use crate::arch::x86_64::idt::{self, InterruptStackFrame};
+use crate::events::{self, Event};
 use crate::pic;
-use crate::wm;
+use crate::sched;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,7 +18,8 @@ pub fn ticks() -> u64 {
 extern "x86-interrupt" fn timer_irq(_frame: InterruptStackFrame) {
     let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     pic::eoi(0);
-    wm::tick(t);
+    events::push(Event::Tick(t));
+    sched::preempt();
 }
 
 pub fn init() {

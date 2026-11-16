@@ -2,8 +2,9 @@ KERNEL  := target/x86_64-unknown-none/debug/anarchy-kernel
 ISO_DIR := build/iso_root
 ISO     := build/anarchyos.iso
 LIMINE  := third_party/limine
+DISK    := build/disk.img
 
-.PHONY: all kernel iso run clean
+.PHONY: all kernel iso disk run clean reset-disk
 
 all: iso
 
@@ -24,11 +25,19 @@ iso: kernel
 		$(ISO_DIR) -o $(ISO)
 	$(LIMINE)/limine bios-install $(ISO)
 
-run: iso
+disk:
+	@mkdir -p build
+	@[ -f $(DISK) ] || dd if=/dev/zero of=$(DISK) bs=1m count=1 2>/dev/null
+
+run: iso disk
 	qemu-system-x86_64 -M q35 -m 512M -cdrom $(ISO) \
+		-drive file=$(DISK),if=none,format=raw,id=disk0 \
+		-device virtio-blk-pci,drive=disk0,disable-modern=on \
 		-display cocoa,zoom-to-fit=on -serial stdio -no-reboot -no-shutdown
 
 clean:
 	cargo clean
-	rm -rf build
+	rm -rf $(ISO_DIR) $(ISO)
 
+reset-disk:
+	rm -f $(DISK)

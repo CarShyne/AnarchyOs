@@ -1,6 +1,8 @@
 use crate::framebuffer as fb;
+use crate::fs;
 use crate::heap;
 use crate::pit;
+use crate::settings;
 use alloc::format;
 use alloc::string::String;
 use core::ptr::addr_of_mut;
@@ -100,7 +102,11 @@ fn run(cmd: &str) {
     let rest = parts.next().unwrap_or("");
     match name {
         "" => {}
-        "help" => print("commands: help, about, mem, uptime, echo, clear"),
+        "help" => {
+            print("commands: help, about, mem, uptime, echo, clear");
+            print("files:    ls, cat <file>, write <file> <text>");
+            print("settings: settings, get <key>, set <key> <value>");
+        }
         "about" => {
             print("AnarchyOS v0.1.0");
             print("A clean, fun kernel and desktop.");
@@ -115,6 +121,57 @@ fn run(cmd: &str) {
         }
         "echo" => print(rest),
         "clear" => term().count = 0,
+        "ls" => {
+            let mut any = false;
+            fs::list(|n, size| {
+                any = true;
+                print(&format!("{:<24} {} B", n, size));
+            });
+            if !any {
+                print("(no files)");
+            }
+        }
+        "cat" => match fs::read(rest) {
+            Some(data) => {
+                let text = String::from_utf8_lossy(&data);
+                for line in text.lines().take(12) {
+                    print(line);
+                }
+            }
+            None => print("no such file"),
+        },
+        "write" => {
+            let mut p = rest.splitn(2, ' ');
+            let file = p.next().unwrap_or("");
+            let body = p.next().unwrap_or("");
+            match fs::write(file, body.as_bytes()) {
+                Ok(()) => print(&format!("saved {} ({} B)", file, body.len())),
+                Err(e) => print(e),
+            }
+        }
+        "settings" => {
+            for (k, v) in settings::all() {
+                print(&format!("{:<14} {}", k, v));
+            }
+        }
+        "get" => match settings::get(rest) {
+            Some(v) => print(&format!("{} = {}", rest, v)),
+            None => print("no such setting"),
+        },
+        "set" => {
+            let mut p = rest.splitn(2, ' ');
+            let key = p.next().unwrap_or("");
+            let value = p.next().unwrap_or("");
+            if key.is_empty() || value.is_empty() {
+                print("usage: set <key> <value>");
+            } else {
+                settings::set(key, value);
+                match settings::flush() {
+                    Ok(()) => print(&format!("{} = {} (saved)", key, value)),
+                    Err(e) => print(e),
+                }
+            }
+        }
         other => print(&format!("unknown command: {}", other)),
     }
 }

@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 #![feature(alloc_error_handler)]
+#![allow(dead_code, unused_unsafe)]
 
 extern crate alloc;
 
@@ -9,21 +10,27 @@ extern crate alloc;
 mod serial;
 mod arch;
 mod console;
+mod events;
 mod framebuffer;
+mod fs;
 mod heap;
 mod paging;
 mod pic;
-mod pmm;
 mod pit;
+mod pmm;
 mod ps2;
+mod sched;
 mod scene;
+mod settings;
 mod terminal;
+mod virtio_blk;
 mod wm;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::panic::PanicInfo;
+use events::Event;
 use limine::BaseRevision;
 use limine::request::{
     FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
@@ -52,6 +59,20 @@ static _START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
 #[used]
 #[link_section = ".requests_end_marker"]
 static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
+
+fn main_loop() -> ! {
+    loop {
+        while let Some(ev) = events::pop() {
+            match ev {
+                Event::Key(c) => wm::key(c),
+                Event::Mouse { dx, dy, left } => wm::mouse(dx, dy, left),
+                Event::Tick(t) => wm::tick(t),
+                Event::Empty => {}
+            }
+        }
+        unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
+    }
+}
 
 #[no_mangle]
 unsafe extern "C" fn kmain() -> ! {
@@ -95,8 +116,6 @@ unsafe extern "C" fn kmain() -> ! {
     heap::init(root);
     framebuffer::alloc_backbuffer();
 
-    // Heap test: a Box and a Vec that grows past one page, both dropped
-    // at the end of the block. Free memory should match before and after.
     let before = heap::free_bytes();
     {
         let boxed = Box::new(0x5A17_u64);
@@ -126,15 +145,21 @@ unsafe extern "C" fn kmain() -> ! {
     asm!("int3");
     kprintln!("returned from breakpoint, exceptions work");
 
-    // Hand the screen to the window manager. Logging continues on serial.
+    ps2::init();
+    if virtio_blk::init(root) {
+        fs::init();
+        settings::load();
+    } else {
+        kprintln!("storage: no virtio disk attached");
+    }
+
     console::disable();
     wm::init();
-    ps2::init();
     pit::init();
-    asm!("sti", options(nomem, nostack));
-    kprintln!("window manager ready: drag windows by their title bars");
+    kprintln!("events, storage and desktop ready");
 
-    halt()
+    asm!("sti", options(nomem, nostack));
+    main_loop()
 }
 
 fn halt() -> ! {
