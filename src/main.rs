@@ -34,13 +34,29 @@ unsafe extern "C" fn kmain() -> ! {
     kprintln!("booted via Limine, serial online");
 
     arch::x86_64::init();
-    kprintln!("gdt and idt loaded");
+    kprintln!("gdt, tss and idt loaded");
 
-    // Test: a breakpoint should print a message and return here.
+    // Test 1: a breakpoint should print a message and return here.
     asm!("int3");
     kprintln!("returned from breakpoint, exceptions work");
 
-    halt()
+    // Test 2: this never returns. It should print a double fault report
+    // from the IST stack instead of hanging.
+    double_fault_test()
+}
+
+/// Corrupt rsp so the CPU cannot push an exception frame. The resulting
+/// exception chain escalates to a double fault, which must use the IST stack.
+fn double_fault_test() -> ! {
+    kprintln!("testing double fault on IST stack...");
+    unsafe {
+        asm!(
+            "mov rsp, {bad}",
+            "int3",
+            bad = in(reg) 0xdead_beef_0000_0000u64,
+            options(noreturn),
+        );
+    }
 }
 
 fn halt() -> ! {

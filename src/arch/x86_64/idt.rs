@@ -2,7 +2,10 @@
 //! interrupts) to handler functions.
 
 use crate::arch::x86_64::gdt::{DescriptorTablePointer, KERNEL_CODE};
+use crate::arch::x86_64::tss;
+use crate::kprintln;
 use core::arch::asm;
+use core::ptr::addr_of_mut;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -27,12 +30,13 @@ impl Entry {
         reserved: 0,
     };
 
-    fn set(&mut self, handler: u64) {
+    /// `ist` is 0 for the normal stack, or 1-7 to switch to a TSS IST stack.
+    fn set(&mut self, handler: u64, ist: u8) {
         self.offset_low = handler as u16;
         self.offset_mid = (handler >> 16) as u16;
         self.offset_high = (handler >> 32) as u32;
         self.selector = KERNEL_CODE;
-        self.ist = 0;
+        self.ist = ist;
         self.type_attr = 0x8E; // present, ring 0, 64-bit interrupt gate
         self.reserved = 0;
     }
@@ -85,6 +89,7 @@ extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, error_code: u64) -> ! {
+    // Runs on the IST stack, so it works even when the main stack is broken.
     kprintln!("EXCEPTION: double fault (#DF), error code {:#x}", error_code);
     dump(&frame);
     halt();
@@ -110,17 +115,17 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
 
 pub fn init() {
     unsafe {
-        let idt = &mut *core::ptr::addr_of_mut!(IDT);
+        let idt = &mut *addr_of_mut!(IDT);
 
-        idt[0].set(divide_error as *const () as u64);
-        idt[3].set(breakpoint as *const () as u64);
-        idt[6].set(invalid_opcode as *const () as u64);
-        idt[8].set(double_fault as *const () as u64);
-        idt[13].set(general_protection as *const () as u64);
-        idt[14].set(page_fault as *const () as u64);
+        idt[0].set(divide_error as *const () as u64, 0);
+        idt[3].set(breakpoint as *const () as u64, 0);
+        idt[6].set(invalid_opcode as *const () as u64, 0);
+        idt[8].set(double_fault as *const () as u64, tss::IST_DOUBLE_FAULT);
+        idt[13].set(general_protection as *const () as u64, 0);
+        idt[14].set(page_fault as *const () as u64, 0);
 
         let ptr = DescriptorTablePointer {
-            limit: (core::mem::size_of_val(&*idt) - 1) as u16,
+            limit: (idt.len() * core::mem::size_of::<Entry>() - 1) as u16,
             base: idt.as_ptr() as u64,
         };
         asm!("lidt [{}]", in(reg) &ptr as *const DescriptorTablePointer,

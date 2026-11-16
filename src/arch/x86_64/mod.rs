@@ -1,9 +1,12 @@
 pub mod gdt;
 pub mod idt;
+pub mod tss;
 
-/// Bring up the CPU tables. The GDT must come first, because
-/// IDT entries refer to the kernel code segment selector.
+/// Bring up the CPU tables. Order matters: the TSS must be filled in
+/// before the GDT references it, and the GDT must be loaded before the
+/// IDT, because IDT entries refer to the kernel code selector.
 pub fn init() {
+    tss::init();
     gdt::init();
     idt::init();
 }
