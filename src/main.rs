@@ -1,13 +1,19 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![feature(alloc_error_handler)]
+
+extern crate alloc;
 
 #[macro_use]
 mod serial;
 mod arch;
+mod heap;
 mod paging;
 mod pmm;
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::arch::asm;
 use core::panic::PanicInfo;
 use limine::BaseRevision;
@@ -55,31 +61,35 @@ unsafe extern "C" fn kmain() -> ! {
     let root = paging::init();
     paging::self_test(root);
 
-    // Test 1: a breakpoint should print a message and return here.
+    heap::init(root);
+
+    // Test 1: a Box on the heap.
+    let boxed = Box::new(0x5A17_u64);
+    kprintln!("heap: Box holds {:#x}", *boxed);
+    drop(boxed);
+
+    // Test 2: a Vec that grows past one 4 KiB page.
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..2048u64 {
+        v.push(i * 3);
+    }
+    let sum: u64 = v.iter().sum();
+    let expected: u64 = (0..2048u64).map(|i| i * 3).sum();
+    kprintln!(
+        "heap: Vec grew to {} entries ({} KiB), sum {}",
+        v.len(),
+        v.len() * 8 / 1024,
+        if sum == expected { "ok" } else { "MISMATCH" }
+    );
+    drop(v);
+
+    kprintln!("heap tests done");
+
+    // The breakpoint test returns, so run it last before halting.
     asm!("int3");
     kprintln!("returned from breakpoint, exceptions work");
 
-    // Test 2: read an unmapped address. Expect a decoded page-fault report.
-    // The handler halts, so this is the last test.
-    kprintln!("testing page fault on unmapped address...");
-    let _ = core::ptr::read_volatile(0xffff_9100_0000_0000u64 as *const u64);
-
     halt()
-}
-
-/// Re-enable this to test the double-fault stack. It halts, so call it
-/// in place of the page-fault test.
-#[allow(dead_code)]
-fn double_fault_test() -> ! {
-    kprintln!("testing double fault on IST stack...");
-    unsafe {
-        asm!(
-            "mov rsp, {bad}",
-            "int3",
-            bad = in(reg) 0xdead_beef_0000_0000u64,
-            options(noreturn),
-        );
-    }
 }
 
 fn halt() -> ! {
