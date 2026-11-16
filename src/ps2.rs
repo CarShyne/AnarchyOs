@@ -1,12 +1,13 @@
-//! PS/2 keyboard and mouse through the 8042 controller. Keyboard input is
-//! decoded from scan code set 1 and shown on the screen. Mouse packets move
-//! a software cursor, and left clicks are logged to serial.
+//! PS/2 keyboard and mouse through the 8042 controller. Keys are decoded
+//! from scan code set 1 and sent to the Keys window. Mouse packets become
+//! pointer events for the window manager.
 
 use crate::arch::x86_64::idt::{self, InterruptStackFrame};
 use crate::framebuffer as fb;
 use crate::pic;
+use crate::wm;
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 const DATA: u16 = 0x60;
 const STATUS_CMD: u16 = 0x64;
@@ -59,10 +60,19 @@ fn mouse_write(value: u8) {
 
 // ---- Keyboard ----------------------------------------------------------
 
+pub const TYPED_MAX: usize = 40;
 static SHIFT: AtomicBool = AtomicBool::new(false);
-const TYPED_MAX: usize = 40;
 static TYPED: [AtomicU8; TYPED_MAX] = [const { AtomicU8::new(0) }; TYPED_MAX];
 static TYPED_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Copy the typed text into `buf`, returning its length.
+pub fn copy_typed(buf: &mut [u8; TYPED_MAX]) -> usize {
+    let len = TYPED_LEN.load(Ordering::Relaxed);
+    for i in 0..len {
+        buf[i] = TYPED[i].load(Ordering::Relaxed);
+    }
+    len
+}
 
 /// Map a make scan code (set 1) to ASCII. Zero means no printable character.
 fn decode(sc: u8, shift: bool) -> u8 {
@@ -84,18 +94,6 @@ fn decode(sc: u8, shift: bool) -> u8 {
     }
 }
 
-fn redraw_typed() {
-    fb::fill_rect(14, 44, 900, 20, 0x0010_1828);
-    let len = TYPED_LEN.load(Ordering::Relaxed);
-    let mut buf = [0u8; TYPED_MAX];
-    for (i, slot) in buf.iter_mut().enumerate().take(len) {
-        *slot = TYPED[i].load(Ordering::Relaxed);
-    }
-    fb::draw_text(14, 46, "> ", 0x0070_D694, 2);
-    let text = core::str::from_utf8(&buf[..len]).unwrap_or("");
-    fb::draw_text(46, 46, text, 0x00E6_ECF5, 2);
-}
-
 fn push_key(c: u8) {
     let len = TYPED_LEN.load(Ordering::Relaxed);
     if c == 0x08 {
@@ -108,72 +106,32 @@ fn push_key(c: u8) {
         TYPED[len].store(c, Ordering::Relaxed);
         TYPED_LEN.store(len + 1, Ordering::Relaxed);
     }
-    redraw_typed();
+    wm::refresh_keys();
 }
 
 extern "x86-interrupt" fn keyboard_irq(_frame: InterruptStackFrame) {
     let sc = unsafe { inb(DATA) };
     match sc {
-        0x2A | 0x36 => SHIFT.store(true, Ordering::Relaxed),  // shift pressed
-        0xAA | 0xB6 => SHIFT.store(false, Ordering::Relaxed), // shift released
+        0x2A | 0x36 => SHIFT.store(true, Ordering::Relaxed),
+        0xAA | 0xB6 => SHIFT.store(false, Ordering::Relaxed),
         _ if sc & 0x80 == 0 => {
             let c = decode(sc, SHIFT.load(Ordering::Relaxed));
             if c != 0 {
                 push_key(c);
             }
         }
-        _ => {} // other key releases are ignored for now
+        _ => {}
     }
     pic::eoi(1);
 }
 
 // ---- Mouse -------------------------------------------------------------
 
-const CUR_BOX: u32 = 12;
-static SAVED: [AtomicU32; (CUR_BOX * CUR_BOX) as usize] =
-    [const { AtomicU32::new(0) }; (CUR_BOX * CUR_BOX) as usize];
-static CUR_X: AtomicU32 = AtomicU32::new(0);
-static CUR_Y: AtomicU32 = AtomicU32::new(0);
-static LEFT_DOWN: AtomicBool = AtomicBool::new(false);
 static PACKET: [AtomicU8; 3] = [const { AtomicU8::new(0) }; 3];
 static PKT_IDX: AtomicUsize = AtomicUsize::new(0);
 
-fn save_under(x: u32, y: u32) {
-    for dy in 0..CUR_BOX {
-        for dx in 0..CUR_BOX {
-            let px = fb::get_pixel(x + dx, y + dy);
-            SAVED[(dy * CUR_BOX + dx) as usize].store(px, Ordering::Relaxed);
-        }
-    }
-}
-
-fn restore(x: u32, y: u32) {
-    for dy in 0..CUR_BOX {
-        for dx in 0..CUR_BOX {
-            let px = SAVED[(dy * CUR_BOX + dx) as usize].load(Ordering::Relaxed);
-            fb::put_pixel(x + dx, y + dy, px);
-        }
-    }
-}
-
-/// Draw a simple white arrow in the top-left of the cursor box.
-fn paint(x: u32, y: u32) {
-    for row in 0..10u32 {
-        let width = (row + 1).min(7);
-        for col in 0..width {
-            fb::put_pixel(x + col, y + row, 0x00FF_FFFF);
-        }
-    }
-}
-
-fn move_cursor(nx: u32, ny: u32) {
-    let ox = CUR_X.load(Ordering::Relaxed);
-    let oy = CUR_Y.load(Ordering::Relaxed);
-    restore(ox, oy);
-    save_under(nx, ny);
-    paint(nx, ny);
-    CUR_X.store(nx, Ordering::Relaxed);
-    CUR_Y.store(ny, Ordering::Relaxed);
+fn clamp_axis(v: i32, max: u32) -> u32 {
+    v.max(0).min(max as i32 - 1) as u32
 }
 
 fn handle_packet(p: [u8; 3]) {
@@ -188,18 +146,11 @@ fn handle_packet(p: [u8; 3]) {
         dy -= 256;
     }
 
-    let max_x = (fb::width() - CUR_BOX) as i32;
-    let max_y = (fb::height() - CUR_BOX) as i32;
+    let (cx, cy) = wm::cursor();
     // PS/2 reports Y increasing upward, screen Y increases downward.
-    let x = (CUR_X.load(Ordering::Relaxed) as i32 + dx).clamp(0, max_x) as u32;
-    let y = (CUR_Y.load(Ordering::Relaxed) as i32 - dy).clamp(0, max_y) as u32;
-    move_cursor(x, y);
-
-    let left = flags & 0b001 != 0;
-    if left && !LEFT_DOWN.load(Ordering::Relaxed) {
-        crate::kprintln!("click at ({}, {})", x, y);
-    }
-    LEFT_DOWN.store(left, Ordering::Relaxed);
+    let x = clamp_axis(cx as i32 + dx, fb::width());
+    let y = clamp_axis(cy as i32 - dy, fb::height());
+    wm::pointer(x, y, flags & 0b001 != 0);
 }
 
 extern "x86-interrupt" fn mouse_irq(_frame: InterruptStackFrame) {
@@ -207,7 +158,7 @@ extern "x86-interrupt" fn mouse_irq(_frame: InterruptStackFrame) {
     let idx = PKT_IDX.load(Ordering::Relaxed);
 
     // The first byte of every packet has bit 3 set. If it isn't, we have
-    // lost sync, so skip this byte and wait for a valid first byte.
+    // lost sync, so drop this byte and wait for a valid first byte.
     if idx == 0 && byte & 0x08 == 0 {
         // out of sync, drop the byte
     } else {
@@ -257,14 +208,6 @@ pub fn init() {
     let _ = read_data(); // ACK
     mouse_write(0xF4);
     let _ = read_data(); // ACK
-
-    // Park the cursor in the middle of the screen before IRQs can move it.
-    let cx = fb::width() / 2;
-    let cy = fb::height() / 2;
-    CUR_X.store(cx, Ordering::Relaxed);
-    CUR_Y.store(cy, Ordering::Relaxed);
-    save_under(cx, cy);
-    paint(cx, cy);
 
     idt::set_irq(KEYBOARD_VECTOR, keyboard_irq as *const () as u64);
     idt::set_irq(MOUSE_VECTOR, mouse_irq as *const () as u64);

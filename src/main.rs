@@ -16,6 +16,7 @@ mod pic;
 mod pmm;
 mod ps2;
 mod scene;
+mod wm;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -122,13 +123,12 @@ unsafe extern "C" fn kmain() -> ! {
     asm!("int3");
     kprintln!("returned from breakpoint, exceptions work");
 
-    kprintln!("drawing demo scene (console off, serial only from here)");
-    scene::draw();
-
-    // Input. Interrupts stay off until the controller and PIC are ready.
+    // Hand the screen to the window manager. Logging continues on serial.
+    console::disable();
+    wm::init();
     ps2::init();
     asm!("sti", options(nomem, nostack));
-    kprintln!("interrupts on, type on the keyboard, move the mouse");
+    kprintln!("window manager ready: drag windows by their title bars");
 
     halt()
 }

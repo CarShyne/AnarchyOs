@@ -1,8 +1,9 @@
-//! Pixel drawing on the framebuffer Limine gives us. Colors are 0x00RRGGBB,
-//! the layout Limine uses for 32 bpp modes.
+//! Pixel drawing on the framebuffer Limine gives us. Colors are 0x00RRGGBB.
+//! All drawing goes through a clip rectangle, so the window manager can
+//! repaint just the region that changed.
 
 use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use font8x8::legacy::BASIC_LEGACY;
 
 static ADDR: AtomicU64 = AtomicU64::new(0);
@@ -10,11 +11,17 @@ static WIDTH: AtomicU64 = AtomicU64::new(0);
 static HEIGHT: AtomicU64 = AtomicU64::new(0);
 static PITCH: AtomicU64 = AtomicU64::new(0);
 
+static CLIP_X0: AtomicU32 = AtomicU32::new(0);
+static CLIP_Y0: AtomicU32 = AtomicU32::new(0);
+static CLIP_X1: AtomicU32 = AtomicU32::new(0);
+static CLIP_Y1: AtomicU32 = AtomicU32::new(0);
+
 pub fn init(addr: u64, width: u64, height: u64, pitch: u64) {
     ADDR.store(addr, Ordering::Relaxed);
     WIDTH.store(width, Ordering::Relaxed);
     HEIGHT.store(height, Ordering::Relaxed);
     PITCH.store(pitch, Ordering::Relaxed);
+    reset_clip();
 }
 
 pub fn width() -> u32 {
@@ -25,21 +32,52 @@ pub fn height() -> u32 {
     HEIGHT.load(Ordering::Relaxed) as u32
 }
 
+/// Restrict all drawing to a rectangle. Clamped to the screen.
+pub fn set_clip(x: u32, y: u32, w: u32, h: u32) {
+    let x0 = x.min(width());
+    let y0 = y.min(height());
+    let x1 = x.saturating_add(w).min(width());
+    let y1 = y.saturating_add(h).min(height());
+    CLIP_X0.store(x0, Ordering::Relaxed);
+    CLIP_Y0.store(y0, Ordering::Relaxed);
+    CLIP_X1.store(x1, Ordering::Relaxed);
+    CLIP_Y1.store(y1, Ordering::Relaxed);
+}
+
+pub fn reset_clip() {
+    set_clip(0, 0, width(), height());
+}
+
+fn clip() -> (u32, u32, u32, u32) {
+    (
+        CLIP_X0.load(Ordering::Relaxed),
+        CLIP_Y0.load(Ordering::Relaxed),
+        CLIP_X1.load(Ordering::Relaxed),
+        CLIP_Y1.load(Ordering::Relaxed),
+    )
+}
+
 fn pixel_addr(x: u32, y: u32) -> u64 {
     ADDR.load(Ordering::Relaxed)
         + y as u64 * PITCH.load(Ordering::Relaxed)
         + x as u64 * 4
 }
 
-pub fn put_pixel(x: u32, y: u32, color: u32) {
-    if x >= width() || y >= height() {
-        return;
-    }
+/// Write without a clip check. Callers must already be inside the clip.
+fn raw_put(x: u32, y: u32, color: u32) {
     unsafe { ptr::write_volatile(pixel_addr(x, y) as *mut u32, color) };
 }
 
-pub fn get_pixel(x: u32, y: u32) -> u32 {
+fn get_pixel(x: u32, y: u32) -> u32 {
     unsafe { ptr::read_volatile(pixel_addr(x, y) as *const u32) }
+}
+
+pub fn put_pixel(x: u32, y: u32, color: u32) {
+    let (x0, y0, x1, y1) = clip();
+    if x < x0 || x >= x1 || y < y0 || y >= y1 {
+        return;
+    }
+    raw_put(x, y, color);
 }
 
 /// Blend `fg` over `bg`. `alpha` runs from 0 (only bg) to 255 (only fg).
@@ -54,22 +92,28 @@ pub fn mix(bg: u32, fg: u32, alpha: u32) -> u32 {
 }
 
 pub fn fill_rect(x: u32, y: u32, w: u32, h: u32, color: u32) {
-    let x_end = x.saturating_add(w).min(width());
-    let y_end = y.saturating_add(h).min(height());
-    for py in y..y_end {
-        for px in x..x_end {
-            put_pixel(px, py, color);
+    let (cx0, cy0, cx1, cy1) = clip();
+    let x0 = x.max(cx0);
+    let y0 = y.max(cy0);
+    let x1 = x.saturating_add(w).min(cx1);
+    let y1 = y.saturating_add(h).min(cy1);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            raw_put(px, py, color);
         }
     }
 }
 
 pub fn blend_rect(x: u32, y: u32, w: u32, h: u32, color: u32, alpha: u32) {
-    let x_end = x.saturating_add(w).min(width());
-    let y_end = y.saturating_add(h).min(height());
-    for py in y..y_end {
-        for px in x..x_end {
+    let (cx0, cy0, cx1, cy1) = clip();
+    let x0 = x.max(cx0);
+    let y0 = y.max(cy0);
+    let x1 = x.saturating_add(w).min(cx1);
+    let y1 = y.saturating_add(h).min(cy1);
+    for py in y0..y1 {
+        for px in x0..x1 {
             let bg = get_pixel(px, py);
-            put_pixel(px, py, mix(bg, color, alpha));
+            raw_put(px, py, mix(bg, color, alpha));
         }
     }
 }
@@ -87,8 +131,7 @@ fn isqrt(n: u32) -> u32 {
     x
 }
 
-/// How far a corner row is pulled in from the rectangle's edge. Row 0 is
-/// the top row of a corner of radius r.
+/// How far a corner row is pulled in from the rectangle's edge.
 fn corner_inset(r: u32, row: u32) -> u32 {
     let d = r - row;
     r - isqrt(r * r - d * d)
