@@ -38,7 +38,7 @@ pub fn put_pixel(x: u32, y: u32, color: u32) {
     unsafe { ptr::write_volatile(pixel_addr(x, y) as *mut u32, color) };
 }
 
-fn get_pixel(x: u32, y: u32) -> u32 {
+pub fn get_pixel(x: u32, y: u32) -> u32 {
     unsafe { ptr::read_volatile(pixel_addr(x, y) as *const u32) }
 }
 

@@ -12,7 +12,9 @@ mod console;
 mod framebuffer;
 mod heap;
 mod paging;
+mod pic;
 mod pmm;
+mod ps2;
 mod scene;
 
 use alloc::boxed::Box;
@@ -122,6 +124,11 @@ unsafe extern "C" fn kmain() -> ! {
 
     kprintln!("drawing demo scene (console off, serial only from here)");
     scene::draw();
+
+    // Input. Interrupts stay off until the controller and PIC are ready.
+    ps2::init();
+    asm!("sti", options(nomem, nostack));
+    kprintln!("interrupts on, type on the keyboard, move the mouse");
 
     halt()
 }

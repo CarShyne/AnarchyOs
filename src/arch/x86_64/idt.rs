@@ -131,3 +131,9 @@ pub fn init() {
              options(readonly, nostack, preserves_flags));
     }
 }
+
+/// Install a handler for a hardware interrupt vector (32-255). The IDT is
+/// already loaded, so changing an entry takes effect immediately.
+pub fn set_irq(vector: u8, handler: u64) {
+    unsafe { (&mut *addr_of_mut!(IDT))[vector as usize].set(handler, 0) };
+}
