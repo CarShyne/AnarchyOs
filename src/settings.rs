@@ -4,11 +4,9 @@ use alloc::vec::Vec;
 use core::ptr::addr_of_mut;
 
 pub const FILE: &str = "settings.cfg";
-pub const TOP_OPACITY: &str = "top_opacity";
-pub const DOCK_OPACITY: &str = "dock_opacity";
-pub const OPACITY_KEYS: [&str; 2] = [TOP_OPACITY, DOCK_OPACITY];
 
-const DEFAULTS: [(&str, &str); 2] = [(TOP_OPACITY, "60"), (DOCK_OPACITY, "60")];
+static mut DISK_OK: bool = false;
+static mut WARNED: bool = false;
 
 static mut STORE: Vec<(String, String)> = Vec::new();
 static mut DIRTY: bool = false;
@@ -31,10 +29,8 @@ fn set_in(s: &mut Vec<(String, String)>, key: &str, value: &str) {
 pub fn load() -> bool {
     let s = store();
     s.clear();
-    for &(k, v) in DEFAULTS.iter() {
-        set_in(s, k, v);
-    }
     *dirty() = false;
+    unsafe { *addr_of_mut!(DISK_OK) = true };
 
     let data = match fs::read(FILE) {
         Some(d) => d,
@@ -82,8 +78,18 @@ pub fn flush() -> Result<(), &'static str> {
     Ok(())
 }
 
-pub fn opacity() -> [u32; 2] {
-    [get_u32(TOP_OPACITY, 60).min(100), get_u32(DOCK_OPACITY, 60).min(100)]
+/// Save if there is a disk to save to. Without one, settings still apply
+/// for this session, and the reason is logged once instead of every time.
+pub fn flush_quietly() {
+    let disk_ok = unsafe { *addr_of_mut!(DISK_OK) };
+    let result = if disk_ok { flush() } else { Err("no disk attached") };
+    if let Err(e) = result {
+        let warned = unsafe { &mut *addr_of_mut!(WARNED) };
+        if !*warned {
+            *warned = true;
+            kprintln!("settings: not saved ({}), changes last until reboot", e);
+        }
+    }
 }
 
 pub fn all() -> Vec<(String, String)> {

@@ -27,6 +27,7 @@ static mut REGION_COUNT: usize = 0;
 /// doubles as the end-of-list marker.
 static FREE_LIST: AtomicU64 = AtomicU64::new(0);
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
+static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 
 const fn align_up(x: u64, a: u64) -> u64 {
     (x + a - 1) & !(a - 1)
@@ -66,11 +67,17 @@ pub fn init(entries: &[&Entry], hhdm_offset: u64) {
     }
 
     unsafe { *addr_of_mut!(REGION_COUNT) = count };
+    TOTAL_BYTES.store(total, Ordering::Relaxed);
     kprintln!(
         "pmm: {} usable regions, {} MiB free",
         count,
         total / (1024 * 1024)
     );
+}
+
+/// Usable RAM found at boot, in bytes.
+pub fn total_bytes() -> u64 {
+    TOTAL_BYTES.load(Ordering::Relaxed)
 }
 
 /// Allocate one 4 KiB physical frame. Returns its physical address.

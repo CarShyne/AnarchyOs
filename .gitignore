@@ -1,3 +1,5 @@
 target/
 build/
 third_party/
+assets/*.bmp
+.DS_Store

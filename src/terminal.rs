@@ -1,4 +1,6 @@
-use crate::framebuffer as fb;
+use crate::gfx;
+use crate::image::MONO;
+use crate::theme;
 use crate::fs;
 use crate::heap;
 use crate::pit;
@@ -11,10 +13,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 const COLS: usize = 120;
 const ROWS: usize = 128;
 const INPUT_MAX: usize = 100;
-const LINE_H: u32 = 18;
-const SCALE: u32 = 2;
-const TEXT: u32 = 0x00C8_D3E0;
-const ACCENT: u32 = 0x0070_D694;
+const LINE_H: i32 = 19;
+/// Height of the strip at the bottom of the window that holds the prompt.
+pub const PROMPT_H: i32 = 40;
 
 static BLINK_ON: AtomicBool = AtomicBool::new(true);
 
@@ -180,25 +181,26 @@ fn run(cmd: &str) {
     }
 }
 
-pub fn draw(x: u32, y: u32, w: u32, h: u32) {
+/// Draw the scrollback and the prompt into the body of the window.
+pub fn draw(x: i32, y: i32, w: i32, h: i32) {
     let t = term();
-    let top = y + 40;
-    let prompt_y = y + h - 26;
-    let visible = ((prompt_y - top) / LINE_H) as usize;
+    let top = y + 12;
+    let prompt_y = y + h - 32;
+    let visible = ((prompt_y - 8 - top) / LINE_H).max(0) as usize;
     let shown = t.count.min(visible);
     let start = t.count - shown;
 
     for (i, idx) in (start..t.count).enumerate() {
         let text = core::str::from_utf8(&t.lines[idx][..t.lens[idx]]).unwrap_or("");
-        fb::draw_text(x + 16, top + i as u32 * LINE_H, text, TEXT, SCALE);
+        let color = if text.starts_with("> ") { theme::MUTED } else { theme::TEXT };
+        gfx::text(x + 18, top + i as i32 * LINE_H, &MONO, text, color);
     }
 
-    fb::fill_rect(x + 12, prompt_y - 6, w.saturating_sub(24), 1, 0x0030_3A4E);
+    gfx::rect_a(x + 14, prompt_y - 8, w - 28, 1, theme::WHITE, theme::LINE_A);
     let input = core::str::from_utf8(&t.input[..t.input_len]).unwrap_or("");
-    fb::draw_text(x + 16, prompt_y, "> ", ACCENT, SCALE);
-    fb::draw_text(x + 48, prompt_y, input, TEXT, SCALE);
+    let after_prompt = gfx::text(x + 18, prompt_y, &MONO, "> ", theme::accent());
+    let end = gfx::text(after_prompt, prompt_y, &MONO, input, theme::TEXT);
     if BLINK_ON.load(Ordering::Relaxed) {
-        let cursor_x = x + 48 + t.input_len as u32 * 16;
-        fb::fill_rect(cursor_x, prompt_y, 8, 14, ACCENT);
+        gfx::rect(end + 1, prompt_y + 1, 8, MONO.height - 2, theme::accent());
     }
 }

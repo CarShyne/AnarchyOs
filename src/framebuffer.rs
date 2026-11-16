@@ -1,6 +1,9 @@
-//! Pixel drawing. Everything draws into a back buffer on the heap, and
+//! The screen itself. Everything draws into a back buffer on the heap, and
 //! `present` copies a damaged rectangle to the real screen. Before the heap
 //! exists, drawing goes straight to the screen.
+//!
+//! This file owns the buffers and the clip rectangle, plus the few blocky
+//! primitives the boot console needs. The desktop draws through gfx.rs.
 
 use alloc::vec;
 use core::ptr;
@@ -84,18 +87,6 @@ fn raw_put(x: u32, y: u32, color: u32) {
     unsafe { ptr::write_volatile((target() + offset(x, y)) as *mut u32, color) };
 }
 
-fn get_pixel(x: u32, y: u32) -> u32 {
-    unsafe { ptr::read_volatile((target() + offset(x, y)) as *const u32) }
-}
-
-pub fn put_pixel(x: u32, y: u32, color: u32) {
-    let (x0, y0, x1, y1) = clip();
-    if x < x0 || x >= x1 || y < y0 || y >= y1 {
-        return;
-    }
-    raw_put(x, y, color);
-}
-
 /// Copy a rectangle from the back buffer to the screen. Without a back
 /// buffer, drawing already went to the screen, so this does nothing.
 pub fn present(x: u32, y: u32, w: u32, h: u32) {
@@ -119,17 +110,6 @@ pub fn present(x: u32, y: u32, w: u32, h: u32) {
     }
 }
 
-/// Blend `fg` over `bg`. `alpha` runs from 0 (only bg) to 255 (only fg).
-pub fn mix(bg: u32, fg: u32, alpha: u32) -> u32 {
-    let inv = 255 - alpha;
-    let ch = |shift: u32| {
-        let f = (fg >> shift) & 0xff;
-        let b = (bg >> shift) & 0xff;
-        ((f * alpha + b * inv) / 255) << shift
-    };
-    ch(16) | ch(8) | ch(0)
-}
-
 pub fn fill_rect(x: u32, y: u32, w: u32, h: u32, color: u32) {
     let (cx0, cy0, cx1, cy1) = clip();
     let x0 = x.max(cx0);
@@ -143,51 +123,8 @@ pub fn fill_rect(x: u32, y: u32, w: u32, h: u32, color: u32) {
     }
 }
 
-pub fn blend_rect(x: u32, y: u32, w: u32, h: u32, color: u32, alpha: u32) {
-    let (cx0, cy0, cx1, cy1) = clip();
-    let x0 = x.max(cx0);
-    let y0 = y.max(cy0);
-    let x1 = x.saturating_add(w).min(cx1);
-    let y1 = y.saturating_add(h).min(cy1);
-    for py in y0..y1 {
-        for px in x0..x1 {
-            let bg = get_pixel(px, py);
-            raw_put(px, py, mix(bg, color, alpha));
-        }
-    }
-}
-
 pub fn clear(color: u32) {
     fill_rect(0, 0, width(), height(), color);
-}
-
-/// Integer square root, plenty accurate for corner radii.
-fn isqrt(n: u32) -> u32 {
-    let mut x = 0;
-    while (x + 1) * (x + 1) <= n {
-        x += 1;
-    }
-    x
-}
-
-/// How far a corner row is pulled in from the rectangle's edge.
-fn corner_inset(r: u32, row: u32) -> u32 {
-    let d = r - row;
-    r - isqrt(r * r - d * d)
-}
-
-pub fn fill_rounded_rect(x: u32, y: u32, w: u32, h: u32, r: u32, color: u32) {
-    let r = r.min(w / 2).min(h / 2);
-    for row in 0..h {
-        let inset = if row < r {
-            corner_inset(r, row)
-        } else if row >= h - r {
-            corner_inset(r, h - 1 - row)
-        } else {
-            0
-        };
-        fill_rect(x + inset, y + row, w - 2 * inset, 1, color);
-    }
 }
 
 pub fn draw_char(x: u32, y: u32, c: u8, color: u32, scale: u32) {
@@ -202,14 +139,6 @@ pub fn draw_char(x: u32, y: u32, c: u8, color: u32, scale: u32) {
                 fill_rect(x + col * scale, y + row as u32 * scale, scale, scale, color);
             }
         }
-    }
-}
-
-pub fn draw_text(x: u32, y: u32, text: &str, color: u32, scale: u32) {
-    let mut cx = x;
-    for b in text.bytes() {
-        draw_char(cx, y, b, color, scale);
-        cx += 8 * scale;
     }
 }
 
@@ -243,18 +172,8 @@ pub fn restore_clip(c: (u32, u32, u32, u32)) {
     CLIP_Y1.store(c.3, Ordering::Relaxed);
 }
 
-/// Like fill_rounded_rect, but blends over what is already on screen.
-pub fn blend_rounded_rect(x: u32, y: u32, w: u32, h: u32, r: u32, color: u32, alpha: u32) {
-    let r = r.min(w / 2).min(h / 2);
-    for row in 0..h {
-        let inset = if row < r {
-            corner_inset(r, row)
-        } else if row >= h - r {
-            corner_inset(r, h - 1 - row)
-        } else {
-            0
-        };
-        blend_rect(x + inset, y + row, w - 2 * inset, 1, color, alpha);
-    }
+/// The buffer drawing goes to, as (first pixel, pixels per row). Used by
+/// gfx.rs, which does its own clipping against `current_clip`.
+pub fn surface() -> (*mut u32, usize) {
+    (target() as *mut u32, (PITCH.load(Ordering::Relaxed) / 4) as usize)
 }
-

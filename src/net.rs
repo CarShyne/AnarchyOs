@@ -632,3 +632,29 @@ pub fn command(name: &str, rest: &str) -> bool {
         _ => false,
     }
 }
+
+pub fn renew() {
+    if nic().up {
+        send_arp(1, BCAST, [0; 6], GATEWAY);
+    }
+}
+
+/// What the Settings app shows on its Network page.
+pub struct Info {
+    pub up: bool,
+    pub mac: String,
+    pub ip: String,
+    pub gateway: String,
+    pub arp_entries: usize,
+}
+
+pub fn info() -> Info {
+    let n = nic();
+    Info {
+        up: n.up,
+        mac: fmt_mac(n.mac),
+        ip: fmt_ip(MY_IP),
+        gateway: fmt_ip(GATEWAY),
+        arp_entries: n.arp.iter().flatten().count(),
+    }
+}

@@ -2,6 +2,8 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 #![feature(alloc_error_handler)]
+// Some drivers keep functions that nothing calls yet (the scheduler, frame
+// freeing), and build.rs emits icons that are not all used.
 #![allow(dead_code, unused_unsafe)]
 
 extern crate alloc;
@@ -18,12 +20,21 @@ mod paging;
 mod pic;
 mod pit;
 mod pmm;
+mod clock;
+mod cpu;
+mod gfx;
+mod image;
 mod net;
+mod pci;
 mod ps2;
+mod rtc;
 mod sched;
 mod scene;
 mod settings;
+mod settings_app;
 mod terminal;
+mod theme;
+mod ui;
 mod virtio_blk;
 mod wm;
 
@@ -35,6 +46,7 @@ use events::Event;
 use limine::BaseRevision;
 use limine::request::{
     FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
+    StackSizeRequest,
 };
 
 #[used]
@@ -53,6 +65,12 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[link_section = ".requests"]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
+/// The desktop draws through several layers of calls, so ask the
+/// bootloader for more than its default 64 KiB of stack.
+#[used]
+#[link_section = ".requests"]
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new().with_size(512 * 1024);
+
 #[used]
 #[link_section = ".requests_start_marker"]
 static _START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
@@ -63,16 +81,39 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 fn main_loop() -> ! {
     loop {
+        // Mouse movement that piled up while the last frame was drawing is
+        // added together and handled as one move, so a slow frame makes
+        // the pointer jump ahead instead of falling behind.
+        let mut motion: Option<(i32, i32, bool)> = None;
         while let Some(ev) = events::pop() {
             match ev {
-                Event::Key(c) => wm::key(c),
-                Event::Mouse { dx, dy, left } => wm::mouse(dx, dy, left),
+                Event::Mouse { dx, dy, left } => {
+                    motion = match motion {
+                        Some((px, py, held)) if held == left => Some((px + dx, py + dy, left)),
+                        Some((px, py, held)) => {
+                            // The button changed, so the earlier movement
+                            // has to land first to keep clicks in place.
+                            wm::mouse(px, py, held);
+                            Some((dx, dy, left))
+                        }
+                        None => Some((dx, dy, left)),
+                    };
+                }
+                Event::Key(c) => {
+                    if let Some((px, py, held)) = motion.take() {
+                        wm::mouse(px, py, held);
+                    }
+                    wm::key(c);
+                }
                 Event::Tick(t) => {
                     wm::tick(t);
                     net::poll();
                 }
                 Event::Empty => {}
             }
+        }
+        if let Some((px, py, held)) = motion {
+            wm::mouse(px, py, held);
         }
         unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
     }

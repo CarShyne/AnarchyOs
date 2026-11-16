@@ -9,7 +9,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const HEAP_START: u64 = 0xffff_a000_0000_0000;
-pub const HEAP_SIZE: usize = 8 * 1024 * 1024;
+pub const HEAP_SIZE: usize = 32 * 1024 * 1024;
 
 /// Every block starts and ends on an 8-byte boundary.
 const fn round8(n: usize) -> usize {

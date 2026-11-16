@@ -2,15 +2,25 @@
 name = "anarchy-kernel"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 limine = "0.5"
 font8x8 = { version = "0.3", default-features = false }
 
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+fontdue = "0.9"
+
 [profile.dev]
 panic = "abort"
 opt-level = 1
 
+[profile.dev.build-override]
+opt-level = 3
+
 [profile.release]
 panic = "abort"
 
+[profile.release.build-override]
+opt-level = 3

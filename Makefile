@@ -3,10 +3,17 @@ ISO_DIR := build/iso_root
 ISO     := build/anarchyos.iso
 LIMINE  := third_party/limine
 DISK    := build/disk.img
+WALL    := $(shell find . -type f -path "*/wallpaper/*" ! -name ".*" ! -path "./target/*" ! -path "./build/*" | head -n 1)
+LOGO    := $(shell find . -type f -name "AnarchyOs-logo.png" ! -path "./target/*" ! -path "./build/*" | head -n 1)
 
-.PHONY: all kernel iso disk run clean reset-disk
+.PHONY: all assets kernel iso disk run clean reset-disk
 
 all: iso
+
+assets:
+	@mkdir -p assets
+	sips -s format bmp -z 800 1280 "$(WALL)" --out assets/wallpaper.bmp >/dev/null
+	sips -s format bmp -Z 30 "$(LOGO)" --out assets/logo.bmp >/dev/null
 
 kernel:
 	cargo build
@@ -33,7 +40,9 @@ run: iso disk
 	qemu-system-x86_64 -M q35 -m 512M -cdrom $(ISO) \
 		-drive file=$(DISK),if=none,format=raw,id=disk0 \
 		-device virtio-blk-pci,drive=disk0,disable-modern=on \
-		-netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-modern=on -display cocoa,zoom-to-fit=on -serial stdio -no-reboot -no-shutdown
+		-netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-modern=on \
+		-rtc base=localtime \
+		-display cocoa,zoom-to-fit=on -serial stdio -no-reboot -no-shutdown
 
 clean:
 	cargo clean
