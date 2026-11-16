@@ -9,9 +9,8 @@ font8x8 = { version = "0.3", default-features = false }
 
 [profile.dev]
 panic = "abort"
+opt-level = 1
 
 [profile.release]
 panic = "abort"
 
-[profile.dev]
-opt-level = 1
