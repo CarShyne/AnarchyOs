@@ -8,9 +8,12 @@ extern crate alloc;
 #[macro_use]
 mod serial;
 mod arch;
+mod console;
+mod framebuffer;
 mod heap;
 mod paging;
 mod pmm;
+mod scene;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -18,7 +21,7 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 use limine::BaseRevision;
 use limine::request::{
-    HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
+    FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
 };
 
 #[used]
@@ -32,6 +35,10 @@ static MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 #[used]
 #[link_section = ".requests"]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+#[used]
+#[link_section = ".requests"]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
 #[used]
 #[link_section = ".requests_start_marker"]
@@ -54,6 +61,25 @@ unsafe extern "C" fn kmain() -> ! {
     arch::x86_64::init();
     kprintln!("gdt, tss and idt loaded");
 
+    match FRAMEBUFFER_REQUEST.get_response().and_then(|r| r.framebuffers().next()) {
+        Some(fb) => {
+            framebuffer::init(
+                fb.addr() as u64,
+                fb.width() as u64,
+                fb.height() as u64,
+                fb.pitch() as u64,
+            );
+            console::start();
+            kprintln!(
+                "framebuffer: {}x{} at {:#x}",
+                framebuffer::width(),
+                framebuffer::height(),
+                fb.addr() as u64
+            );
+        }
+        None => kprintln!("framebuffer: none reported, continuing on serial only"),
+    }
+
     let memmap = MEMMAP_REQUEST.get_response().expect("no memory map from Limine");
     let hhdm = HHDM_REQUEST.get_response().expect("no HHDM from Limine");
     pmm::init(memmap.entries(), hhdm.offset());
@@ -63,31 +89,39 @@ unsafe extern "C" fn kmain() -> ! {
 
     heap::init(root);
 
-    // Test 1: a Box on the heap.
-    let boxed = Box::new(0x5A17_u64);
-    kprintln!("heap: Box holds {:#x}", *boxed);
-    drop(boxed);
+    // Heap test: a Box and a Vec that grows past one page, both dropped
+    // at the end of the block. Free memory should match before and after.
+    let before = heap::free_bytes();
+    {
+        let boxed = Box::new(0x5A17_u64);
+        kprintln!("heap: Box holds {:#x}", *boxed);
 
-    // Test 2: a Vec that grows past one 4 KiB page.
-    let mut v: Vec<u64> = Vec::new();
-    for i in 0..2048u64 {
-        v.push(i * 3);
+        let mut v: Vec<u64> = Vec::new();
+        for i in 0..2048u64 {
+            v.push(i * 3);
+        }
+        let sum: u64 = v.iter().sum();
+        let expected: u64 = (0..2048u64).map(|i| i * 3).sum();
+        kprintln!(
+            "heap: Vec grew to {} entries ({} KiB), sum {}",
+            v.len(),
+            v.len() * 8 / 1024,
+            if sum == expected { "ok" } else { "MISMATCH" }
+        );
     }
-    let sum: u64 = v.iter().sum();
-    let expected: u64 = (0..2048u64).map(|i| i * 3).sum();
+    let after = heap::free_bytes();
     kprintln!(
-        "heap: Vec grew to {} entries ({} KiB), sum {}",
-        v.len(),
-        v.len() * 8 / 1024,
-        if sum == expected { "ok" } else { "MISMATCH" }
+        "heap: free {} KiB before, {} KiB after ({})",
+        before / 1024,
+        after / 1024,
+        if before == after { "merged, no leak" } else { "LEAK" }
     );
-    drop(v);
 
-    kprintln!("heap tests done");
-
-    // The breakpoint test returns, so run it last before halting.
     asm!("int3");
     kprintln!("returned from breakpoint, exceptions work");
+
+    kprintln!("drawing demo scene (console off, serial only from here)");
+    scene::draw();
 
     halt()
 }

@@ -1,5 +1,5 @@
-//! COM1 serial output. This is our only debugging channel until the
-//! framebuffer exists, so it has to be reliable.
+//! COM1 serial output, plus a mirror onto the framebuffer console.
+//! Serial is the reliable debugging channel; the screen shows the same text.
 
 use core::arch::asm;
 use core::fmt::{self, Write};
@@ -23,13 +23,13 @@ unsafe fn inb(port: u16) -> u8 {
 /// Set up COM1 at 115200 baud, 8N1, with FIFOs enabled.
 pub fn init() {
     unsafe {
-        outb(COM1 + 1, 0x00); // disable interrupts
-        outb(COM1 + 3, 0x80); // enable DLAB
-        outb(COM1 + 0, 0x01); // divisor low  (115200 baud)
-        outb(COM1 + 1, 0x00); // divisor high
-        outb(COM1 + 3, 0x03); // 8 bits, no parity, one stop bit
-        outb(COM1 + 2, 0xC7); // enable and clear FIFOs
-        outb(COM1 + 4, 0x0B); // RTS/DSR set
+        outb(COM1 + 1, 0x00);
+        outb(COM1 + 3, 0x80);
+        outb(COM1 + 0, 0x01);
+        outb(COM1 + 1, 0x00);
+        outb(COM1 + 3, 0x03);
+        outb(COM1 + 2, 0xC7);
+        outb(COM1 + 4, 0x0B);
     }
 }
 
@@ -39,7 +39,6 @@ impl Write for Serial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for byte in s.bytes() {
             unsafe {
-                // Wait until the transmit holding register is empty.
                 while inb(COM1 + 5) & 0x20 == 0 {}
                 outb(COM1, byte);
             }
@@ -51,6 +50,7 @@ impl Write for Serial {
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     let _ = Serial.write_fmt(args);
+    crate::console::_print(args);
 }
 
 #[macro_export]
@@ -58,4 +58,3 @@ macro_rules! kprintln {
     () => ($crate::serial::_print(format_args!("\n")));
     ($($arg:tt)*) => ($crate::serial::_print(format_args!("{}\n", format_args!($($arg)*))));
 }
-
