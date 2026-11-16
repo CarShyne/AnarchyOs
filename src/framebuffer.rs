@@ -1,12 +1,14 @@
-//! Pixel drawing on the framebuffer Limine gives us. Colors are 0x00RRGGBB.
-//! All drawing goes through a clip rectangle, so the window manager can
-//! repaint just the region that changed.
+//! Pixel drawing. Everything draws into a back buffer on the heap, and
+//! `present` copies a damaged rectangle to the real screen. Before the heap
+//! exists, drawing goes straight to the screen.
 
+use alloc::vec;
 use core::ptr;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use font8x8::legacy::BASIC_LEGACY;
 
-static ADDR: AtomicU64 = AtomicU64::new(0);
+static ADDR: AtomicU64 = AtomicU64::new(0); // real screen
+static BACK: AtomicU64 = AtomicU64::new(0); // off-screen buffer, 0 until allocated
 static WIDTH: AtomicU64 = AtomicU64::new(0);
 static HEIGHT: AtomicU64 = AtomicU64::new(0);
 static PITCH: AtomicU64 = AtomicU64::new(0);
@@ -22,6 +24,14 @@ pub fn init(addr: u64, width: u64, height: u64, pitch: u64) {
     HEIGHT.store(height, Ordering::Relaxed);
     PITCH.store(pitch, Ordering::Relaxed);
     reset_clip();
+}
+
+/// Allocate the back buffer. Call once the heap is ready.
+pub fn alloc_backbuffer() {
+    let size = (PITCH.load(Ordering::Relaxed) * HEIGHT.load(Ordering::Relaxed)) as usize;
+    let buf = vec![0u8; size].into_boxed_slice();
+    let addr = alloc::boxed::Box::leak(buf).as_ptr() as u64;
+    BACK.store(addr, Ordering::Relaxed);
 }
 
 pub fn width() -> u32 {
@@ -57,19 +67,25 @@ fn clip() -> (u32, u32, u32, u32) {
     )
 }
 
-fn pixel_addr(x: u32, y: u32) -> u64 {
-    ADDR.load(Ordering::Relaxed)
-        + y as u64 * PITCH.load(Ordering::Relaxed)
-        + x as u64 * 4
+/// The buffer drawing goes to: the back buffer once it exists.
+fn target() -> u64 {
+    match BACK.load(Ordering::Relaxed) {
+        0 => ADDR.load(Ordering::Relaxed),
+        b => b,
+    }
+}
+
+fn offset(x: u32, y: u32) -> u64 {
+    y as u64 * PITCH.load(Ordering::Relaxed) + x as u64 * 4
 }
 
 /// Write without a clip check. Callers must already be inside the clip.
 fn raw_put(x: u32, y: u32, color: u32) {
-    unsafe { ptr::write_volatile(pixel_addr(x, y) as *mut u32, color) };
+    unsafe { ptr::write_volatile((target() + offset(x, y)) as *mut u32, color) };
 }
 
 fn get_pixel(x: u32, y: u32) -> u32 {
-    unsafe { ptr::read_volatile(pixel_addr(x, y) as *const u32) }
+    unsafe { ptr::read_volatile((target() + offset(x, y)) as *const u32) }
 }
 
 pub fn put_pixel(x: u32, y: u32, color: u32) {
@@ -78,6 +94,29 @@ pub fn put_pixel(x: u32, y: u32, color: u32) {
         return;
     }
     raw_put(x, y, color);
+}
+
+/// Copy a rectangle from the back buffer to the screen. Without a back
+/// buffer, drawing already went to the screen, so this does nothing.
+pub fn present(x: u32, y: u32, w: u32, h: u32) {
+    let back = BACK.load(Ordering::Relaxed);
+    if back == 0 {
+        return;
+    }
+    let front = ADDR.load(Ordering::Relaxed);
+    let x1 = x.saturating_add(w).min(width());
+    let y1 = y.saturating_add(h).min(height());
+    let bytes = ((x1.saturating_sub(x)) * 4) as usize;
+    for py in y..y1 {
+        let off = offset(x, py);
+        unsafe {
+            ptr::copy_nonoverlapping(
+                (back + off) as *const u8,
+                (front + off) as *mut u8,
+                bytes,
+            );
+        }
+    }
 }
 
 /// Blend `fg` over `bg`. `alpha` runs from 0 (only bg) to 255 (only fg).
@@ -174,7 +213,8 @@ pub fn draw_text(x: u32, y: u32, text: &str, color: u32, scale: u32) {
     }
 }
 
-/// Move everything up by `rows` pixel rows, then clear the freed bottom rows.
+/// Move everything up by `rows` pixel rows on the screen, then clear the
+/// freed bottom rows. Used by the boot console only.
 pub fn scroll_up(rows: u32, color: u32) {
     let h = height();
     let rows = rows.min(h);

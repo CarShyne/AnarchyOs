@@ -16,6 +16,7 @@ mod pic;
 mod pmm;
 mod ps2;
 mod scene;
+mod terminal;
 mod wm;
 
 use alloc::boxed::Box;
@@ -91,6 +92,7 @@ unsafe extern "C" fn kmain() -> ! {
     paging::self_test(root);
 
     heap::init(root);
+    framebuffer::alloc_backbuffer();
 
     // Heap test: a Box and a Vec that grows past one page, both dropped
     // at the end of the block. Free memory should match before and after.

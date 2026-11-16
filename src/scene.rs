@@ -1,18 +1,32 @@
-//! The desktop background and top bar. These are drawn under and over the
-//! windows by the window manager, which clips them to the damaged area.
+//! Desktop background and top bar. The wallpaper gradient is computed once
+//! into a row table, so each repaint is a plain fill instead of a blend.
 
 use crate::framebuffer as fb;
+use core::ptr::{addr_of, addr_of_mut};
 
 const TOP_BAR_H: u32 = 28;
+const MAX_H: usize = 1200;
 
-/// Wallpaper gradient and dock. Drawn first, under every window.
+static mut ROW_COLORS: [u32; MAX_H] = [0; MAX_H];
+
+/// Compute the gradient once. Call after the framebuffer is initialized.
+pub fn init() {
+    let h = fb::height().min(MAX_H as u32);
+    let rows = unsafe { &mut *addr_of_mut!(ROW_COLORS) };
+    for y in 0..h {
+        let t = y * 255 / h.max(1);
+        rows[y as usize] = fb::mix(0x000A_0E18, 0x0018_1230, t);
+    }
+}
+
+/// Wallpaper and dock. Drawn first, under every window.
 pub fn draw_background() {
     let w = fb::width();
     let h = fb::height();
+    let rows = unsafe { &*addr_of!(ROW_COLORS) };
 
-    for y in 0..h {
-        let t = y * 255 / h.max(1);
-        fb::fill_rect(0, y, w, 1, fb::mix(0x000A_0E18, 0x0018_1230, t));
+    for y in 0..h.min(MAX_H as u32) {
+        fb::fill_rect(0, y, w, 1, rows[y as usize]);
     }
 
     let dock_w = 400.min(w.saturating_sub(80));
@@ -27,8 +41,7 @@ pub fn draw_background() {
     }
 }
 
-/// Translucent top bar. Drawn last, over the windows, so the windows show
-/// through it.
+/// Translucent top bar, drawn over the windows so they show through it.
 pub fn draw_topbar() {
     let w = fb::width();
     fb::blend_rect(0, 0, w, TOP_BAR_H, 0x0030_3A4E, 150);

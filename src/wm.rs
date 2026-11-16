@@ -1,10 +1,12 @@
 //! Window manager. Windows are rounded rectangles with a title bar, kept in
 //! a back-to-front order. Any change repaints the damaged rectangle from the
-//! background up, so the scene never leaves trails behind.
+//! background up, so nothing leaves trails. Keyboard input goes to the
+//! focused window, which is the one on top.
 
 use crate::framebuffer as fb;
 use crate::ps2;
 use crate::scene;
+use crate::terminal;
 use core::ptr::addr_of_mut;
 
 #[derive(Clone, Copy)]
@@ -41,6 +43,7 @@ impl Rect {
 pub enum Kind {
     Welcome,
     Keys,
+    Terminal,
 }
 
 #[derive(Clone, Copy)]
@@ -50,14 +53,13 @@ struct Window {
     kind: Kind,
 }
 
-const MAX_WINDOWS: usize = 2;
+const MAX_WINDOWS: usize = 3;
 const TITLE_H: u32 = 30;
 const RADIUS: u32 = 14;
-const KEYS_INDEX: usize = 1;
 
 struct State {
     windows: [Window; MAX_WINDOWS],
-    /// Indices into `windows`, back to front. Only open windows appear here.
+    /// Indices into `windows`, back to front. The last entry is focused.
     order: [usize; MAX_WINDOWS],
     count: usize,
     cur_x: u32,
@@ -70,23 +72,25 @@ struct State {
 static mut STATE: State = State {
     windows: [
         Window { rect: Rect::new(120, 110, 560, 320), title: "Welcome", kind: Kind::Welcome },
-        Window { rect: Rect::new(560, 300, 420, 220), title: "Keys", kind: Kind::Keys },
+        Window { rect: Rect::new(560, 150, 420, 200), title: "Keys", kind: Kind::Keys },
+        Window { rect: Rect::new(60, 440, 640, 240), title: "Terminal", kind: Kind::Terminal },
     ],
-    order: [0, 1],
-    count: 2,
+    order: [0, 1, 2],
+    count: 3,
     cur_x: 0,
     cur_y: 0,
     left: false,
     drag: None,
 };
 
-// Only the interrupt path and the one-time init touch this state, and
-// interrupts never nest, so there is no concurrent access.
+// Only the interrupt path and init touch this, and interrupts don't nest.
 fn state() -> &'static mut State {
     unsafe { &mut *addr_of_mut!(STATE) }
 }
 
 pub fn init() {
+    scene::init();
+    terminal::init();
     let s = state();
     s.cur_x = fb::width() / 2;
     s.cur_y = fb::height() / 2;
@@ -140,12 +144,19 @@ pub fn pointer(x: u32, y: u32, left: bool) {
     render(s, damage);
 }
 
-/// Repaint the Keys window after the typed text changed.
-pub fn refresh_keys() {
+/// Route one decoded key to the focused window, then repaint it.
+pub fn key(c: u8) {
     let s = state();
-    if s.order[..s.count].contains(&KEYS_INDEX) {
-        render(s, s.windows[KEYS_INDEX].rect);
+    if s.count == 0 {
+        return;
     }
+    let idx = s.order[s.count - 1];
+    match s.windows[idx].kind {
+        Kind::Keys => ps2::type_key(c),
+        Kind::Terminal => terminal::key(c),
+        Kind::Welcome => return,
+    }
+    render(s, s.windows[idx].rect);
 }
 
 fn clamp(v: i32, lo: i32, hi: i32) -> u32 {
@@ -202,6 +213,7 @@ fn render(s: &State, r: Rect) {
     scene::draw_topbar();
     draw_cursor(s.cur_x, s.cur_y);
     fb::reset_clip();
+    fb::present(r.x, r.y, r.w, r.h);
 }
 
 fn draw_window(win: &Window, focused: bool) {
@@ -220,6 +232,7 @@ fn draw_window(win: &Window, focused: bool) {
     match win.kind {
         Kind::Welcome => welcome_content(win.rect),
         Kind::Keys => keys_content(win.rect),
+        Kind::Terminal => terminal::draw(x, y, w, h),
     }
 }
 

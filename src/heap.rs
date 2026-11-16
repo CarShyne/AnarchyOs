@@ -9,7 +9,12 @@ use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const HEAP_START: u64 = 0xffff_a000_0000_0000;
-pub const HEAP_SIZE: usize = 1024 * 1024;
+pub const HEAP_SIZE: usize = 8 * 1024 * 1024;
+
+/// Every block starts and ends on an 8-byte boundary.
+const fn round8(n: usize) -> usize {
+    (n + 7) & !7
+}
 
 const MIN_BLOCK: usize = core::mem::size_of::<FreeBlock>();
 
@@ -42,7 +47,7 @@ fn with_irqs_off<T>(f: impl FnOnce() -> T) -> T {
 
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let size = layout.size().max(MIN_BLOCK);
+        let size = round8(layout.size().max(MIN_BLOCK));
         let align = layout.align().max(core::mem::align_of::<FreeBlock>());
         with_irqs_off(|| {
             let mut prev: *mut FreeBlock = ptr::null_mut();
@@ -87,7 +92,7 @@ unsafe impl GlobalAlloc for Heap {
     }
 
     unsafe fn dealloc(&self, ptr_: *mut u8, layout: Layout) {
-        let size = layout.size().max(MIN_BLOCK);
+        let size = round8(layout.size().max(MIN_BLOCK));
         with_irqs_off(|| {
             let block = ptr_ as *mut FreeBlock;
             let block_addr = block as usize;

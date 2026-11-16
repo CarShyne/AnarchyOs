@@ -1,6 +1,5 @@
-//! PS/2 keyboard and mouse through the 8042 controller. Keys are decoded
-//! from scan code set 1 and sent to the Keys window. Mouse packets become
-//! pointer events for the window manager.
+//! PS/2 keyboard and mouse through the 8042 controller. Decoded keys go to
+//! the window manager, and mouse packets become pointer events.
 
 use crate::arch::x86_64::idt::{self, InterruptStackFrame};
 use crate::framebuffer as fb;
@@ -65,13 +64,28 @@ static SHIFT: AtomicBool = AtomicBool::new(false);
 static TYPED: [AtomicU8; TYPED_MAX] = [const { AtomicU8::new(0) }; TYPED_MAX];
 static TYPED_LEN: AtomicUsize = AtomicUsize::new(0);
 
-/// Copy the typed text into `buf`, returning its length.
+/// Copy the Keys window's text into `buf`, returning its length.
 pub fn copy_typed(buf: &mut [u8; TYPED_MAX]) -> usize {
     let len = TYPED_LEN.load(Ordering::Relaxed);
     for i in 0..len {
         buf[i] = TYPED[i].load(Ordering::Relaxed);
     }
     len
+}
+
+/// Keys typed while the Keys window is focused.
+pub fn type_key(c: u8) {
+    let len = TYPED_LEN.load(Ordering::Relaxed);
+    if c == 0x08 {
+        if len > 0 {
+            TYPED_LEN.store(len - 1, Ordering::Relaxed);
+        }
+    } else if c == b'\n' {
+        TYPED_LEN.store(0, Ordering::Relaxed);
+    } else if len < TYPED_MAX {
+        TYPED[len].store(c, Ordering::Relaxed);
+        TYPED_LEN.store(len + 1, Ordering::Relaxed);
+    }
 }
 
 /// Map a make scan code (set 1) to ASCII. Zero means no printable character.
@@ -94,21 +108,6 @@ fn decode(sc: u8, shift: bool) -> u8 {
     }
 }
 
-fn push_key(c: u8) {
-    let len = TYPED_LEN.load(Ordering::Relaxed);
-    if c == 0x08 {
-        if len > 0 {
-            TYPED_LEN.store(len - 1, Ordering::Relaxed);
-        }
-    } else if c == b'\n' {
-        TYPED_LEN.store(0, Ordering::Relaxed);
-    } else if len < TYPED_MAX {
-        TYPED[len].store(c, Ordering::Relaxed);
-        TYPED_LEN.store(len + 1, Ordering::Relaxed);
-    }
-    wm::refresh_keys();
-}
-
 extern "x86-interrupt" fn keyboard_irq(_frame: InterruptStackFrame) {
     let sc = unsafe { inb(DATA) };
     match sc {
@@ -117,7 +116,7 @@ extern "x86-interrupt" fn keyboard_irq(_frame: InterruptStackFrame) {
         _ if sc & 0x80 == 0 => {
             let c = decode(sc, SHIFT.load(Ordering::Relaxed));
             if c != 0 {
-                push_key(c);
+                wm::key(c);
             }
         }
         _ => {}
