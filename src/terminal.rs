@@ -47,7 +47,7 @@ pub fn toggle_blink() {
     BLINK_ON.store(!on, Ordering::Relaxed);
 }
 
-fn print(text: &str) {
+pub fn print(text: &str) {
     let t = term();
     if t.count == ROWS {
         for i in 1..ROWS {
@@ -172,7 +172,11 @@ fn run(cmd: &str) {
                 }
             }
         }
-        other => print(&format!("unknown command: {}", other)),
+        other => {
+            if !crate::net::command(other, rest) {
+                print(&format!("unknown command: {}", other));
+            }
+        }
     }
 }
 

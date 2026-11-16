@@ -18,6 +18,7 @@ mod paging;
 mod pic;
 mod pit;
 mod pmm;
+mod net;
 mod ps2;
 mod sched;
 mod scene;
@@ -66,7 +67,10 @@ fn main_loop() -> ! {
             match ev {
                 Event::Key(c) => wm::key(c),
                 Event::Mouse { dx, dy, left } => wm::mouse(dx, dy, left),
-                Event::Tick(t) => wm::tick(t),
+                Event::Tick(t) => {
+                    wm::tick(t);
+                    net::poll();
+                }
                 Event::Empty => {}
             }
         }
@@ -153,6 +157,7 @@ unsafe extern "C" fn kmain() -> ! {
         kprintln!("storage: no virtio disk attached");
     }
 
+    net::init(root);
     console::disable();
     wm::init();
     pit::init();

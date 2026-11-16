@@ -33,7 +33,7 @@ run: iso disk
 	qemu-system-x86_64 -M q35 -m 512M -cdrom $(ISO) \
 		-drive file=$(DISK),if=none,format=raw,id=disk0 \
 		-device virtio-blk-pci,drive=disk0,disable-modern=on \
-		-display cocoa,zoom-to-fit=on -serial stdio -no-reboot -no-shutdown
+		-netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-modern=on -display cocoa,zoom-to-fit=on -serial stdio -no-reboot -no-shutdown
 
 clean:
 	cargo clean
