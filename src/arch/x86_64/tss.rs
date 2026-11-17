@@ -46,6 +46,15 @@ pub fn init() {
     }
 }
 
+/// Stack the CPU switches to when an interrupt or exception arrives while
+/// a program runs in ring 3.
+pub fn set_rsp0(top: u64) {
+    unsafe {
+        let tss = addr_of_mut!(TSS);
+        addr_of_mut!((*tss).rsp[0]).write_unaligned(top);
+    }
+}
+
 pub fn address() -> u64 {
     addr_of_mut!(TSS) as u64
 }

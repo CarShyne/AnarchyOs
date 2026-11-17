@@ -7,7 +7,7 @@ const CAP: usize = 64;
 pub enum Event {
     Empty,
     Key(u8),
-    Mouse { dx: i32, dy: i32, left: bool },
+    Mouse { dx: i32, dy: i32, buttons: u8 },
     Tick(u64),
 }
 

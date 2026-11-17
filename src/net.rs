@@ -1,3 +1,14 @@
+//! Network driver and stack. The virtio-net driver moves frames; the rest of
+//! this file is the stack built on them: ARP, IPv4, ICMP ping, UDP, DHCP,
+//! DNS, a single TCP connection, and a small HTTP/1.0 client. Protocol
+//! encoding lives in netproto.rs, where the tests run on the build machine.
+//!
+//! Everything is polled, not interrupt driven. Blocking calls (DHCP, DNS,
+//! fetch) spin on `wait_until`, which keeps reading the receive ring while
+//! they wait. They run from the event loop, never from an interrupt.
+
+use crate::fs;
+use crate::netproto as np;
 use crate::paging;
 use crate::pit;
 use crate::terminal;
@@ -34,10 +45,16 @@ const BUF: usize = 2048;
 const HDR: usize = 10;
 const SPIN: u32 = 50_000_000;
 const PING_TIMEOUT: u64 = 300;
-const MY_IP: [u8; 4] = [10, 0, 2, 15];
-const GATEWAY: [u8; 4] = [10, 0, 2, 2];
-const BCAST: [u8; 6] = [0xff; 6];
 const ICMP_ID: u16 = 0x4141;
+const BCAST: [u8; 6] = [0xff; 6];
+const BCAST_IP: [u8; 4] = [255; 4];
+const ZERO_IP: [u8; 4] = [0; 4];
+
+/// Our UDP source port for DNS queries.
+const DNS_SPORT: u16 = 40053;
+const TCP_WINDOW: u16 = 16384;
+/// Largest piece of data sent in one TCP segment.
+const TCP_CHUNK: usize = 1200;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -103,8 +120,76 @@ fn nic() -> &'static mut Nic {
     unsafe { &mut *addr_of_mut!(NIC) }
 }
 
-const fn used_off(n: usize) -> usize {
-    (16 * n + 4 + 2 * n + 4095) & !4095
+/// Addresses in use. Starts with the QEMU user-network defaults, so the
+/// stack works before DHCP answers, and DHCP replaces them.
+#[derive(Clone, Copy)]
+struct Config {
+    ip: [u8; 4],
+    mask: [u8; 4],
+    gateway: [u8; 4],
+    dns: [u8; 4],
+    from_dhcp: bool,
+}
+
+static mut CFG: Config = Config {
+    ip: [10, 0, 2, 15],
+    mask: [255, 255, 255, 0],
+    gateway: [10, 0, 2, 2],
+    dns: [10, 0, 2, 3],
+    from_dhcp: false,
+};
+
+fn cfg() -> &'static mut Config {
+    unsafe { &mut *addr_of_mut!(CFG) }
+}
+
+/// Set by init. The first poll after boot runs DHCP, because interrupts are
+/// still off during init and the wait would never end.
+static mut DHCP_PENDING: bool = false;
+static mut DHCP_XID: u32 = 0;
+static mut DHCP_INBOX: Option<np::DhcpReply> = None;
+
+static mut DNS_WANT: Option<u16> = None;
+static mut DNS_ANSWER: Option<[u8; 4]> = None;
+
+#[derive(Clone, Copy, PartialEq)]
+enum TcpState {
+    SynSent,
+    Established,
+    Reset,
+}
+
+struct Conn {
+    st: TcpState,
+    lport: u16,
+    rip: [u8; 4],
+    rport: u16,
+    snd_una: u32,
+    snd_nxt: u32,
+    rcv_nxt: u32,
+    rx: Vec<u8>,
+    fin: bool,
+}
+
+static mut CONN: Option<Conn> = None;
+static mut SEED: u64 = 0;
+
+fn conn() -> Option<&'static mut Conn> {
+    unsafe { (*addr_of_mut!(CONN)).as_mut() }
+}
+
+fn conn_state() -> TcpState {
+    conn().map_or(TcpState::Reset, |c| c.st)
+}
+
+fn random() -> u32 {
+    unsafe {
+        SEED ^= pit::ticks().wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        SEED ^= SEED << 13;
+        SEED ^= SEED >> 7;
+        SEED ^= SEED << 17;
+        (SEED >> 16) as u32
+    }
 }
 
 unsafe fn outb(p: u16, v: u8) {
@@ -258,10 +343,12 @@ pub fn init(root: u64) -> bool {
         outw(base + REG_QUEUE_NOTIFY, 0);
     }
     n.up = true;
-    kprintln!("net: mac {}, ip {}, gateway {}", fmt_mac(mac), fmt_ip(MY_IP), fmt_ip(GATEWAY));
-    send_arp(1, BCAST, [0; 6], GATEWAY);
+    kprintln!("net: mac {}, address via DHCP after boot", fmt_mac(mac));
+    unsafe { DHCP_PENDING = true };
     true
 }
+
+// ---- Frames --------------------------------------------------------------
 
 fn send(frame: &[u8]) -> bool {
     let n = nic();
@@ -304,6 +391,10 @@ fn send(frame: &[u8]) -> bool {
     true
 }
 
+const fn used_off(n: usize) -> usize {
+    (16 * n + 4 + 2 * n + 4095) & !4095
+}
+
 fn repost(id: usize) {
     let n = nic();
     let size = n.rx_size;
@@ -325,7 +416,8 @@ unsafe fn rx_slice(id: usize, len: usize) -> &'static [u8] {
     &buf[HDR..len.min(BUF)]
 }
 
-pub fn poll() {
+/// Read every frame that has arrived and handle it.
+fn poll_rx() {
     if !nic().up {
         return;
     }
@@ -350,6 +442,18 @@ pub fn poll() {
         }
         repost(id);
     }
+}
+
+/// Called from the event loop on every timer tick.
+pub fn poll() {
+    if !nic().up {
+        return;
+    }
+    if unsafe { DHCP_PENDING } {
+        unsafe { DHCP_PENDING = false };
+        startup_dhcp();
+    }
+    poll_rx();
 
     let now = pit::ticks();
     if let Some(p) = nic().ping {
@@ -357,6 +461,21 @@ pub fn poll() {
             terminal::print(&format!("ping {}: no reply", fmt_ip(p.target)));
             nic().ping = None;
         }
+    }
+}
+
+/// Spin, reading frames, until `done` is true or `ms` milliseconds pass.
+fn wait_until(ms: u64, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = pit::ticks() + ms * pit::HZ / 1000;
+    loop {
+        poll_rx();
+        if done() {
+            return true;
+        }
+        if pit::ticks() >= deadline {
+            return false;
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -384,38 +503,7 @@ fn eth(dst: [u8; 6], ethertype: u16, payload: &[u8]) -> Vec<u8> {
     f
 }
 
-fn checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut i = 0;
-    while i + 1 < data.len() {
-        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
-        i += 2;
-    }
-    if i < data.len() {
-        sum += (data[i] as u32) << 8;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-fn ipv4(proto: u8, dst: [u8; 4], payload: &[u8]) -> Vec<u8> {
-    let total = (20 + payload.len()) as u16;
-    let mut h = [0u8; 20];
-    h[0] = 0x45;
-    h[2..4].copy_from_slice(&total.to_be_bytes());
-    h[8] = 64;
-    h[9] = proto;
-    h[12..16].copy_from_slice(&MY_IP);
-    h[16..20].copy_from_slice(&dst);
-    let c = checksum(&h);
-    h[10..12].copy_from_slice(&c.to_be_bytes());
-    let mut out = Vec::with_capacity(20 + payload.len());
-    out.extend_from_slice(&h);
-    out.extend_from_slice(payload);
-    out
-}
+// ---- ARP -----------------------------------------------------------------
 
 fn send_arp(op: u16, dst: [u8; 6], tha: [u8; 6], tpa: [u8; 4]) {
     let n = nic();
@@ -426,7 +514,7 @@ fn send_arp(op: u16, dst: [u8; 6], tha: [u8; 6], tpa: [u8; 4]) {
     p[5] = 4;
     p[6..8].copy_from_slice(&op.to_be_bytes());
     p[8..14].copy_from_slice(&n.mac);
-    p[14..18].copy_from_slice(&MY_IP);
+    p[14..18].copy_from_slice(&cfg().ip);
     p[18..24].copy_from_slice(&tha);
     p[24..28].copy_from_slice(&tpa);
     send(&eth(dst, 0x0806, &p));
@@ -455,11 +543,15 @@ fn learn(ip: [u8; 4], mac: [u8; 6]) {
     n.arp[0] = Some((ip, mac));
 }
 
+/// The machine a packet for `ip` goes to: the address itself on our subnet,
+/// otherwise the gateway.
 fn next_hop(ip: [u8; 4]) -> [u8; 4] {
-    if ip[0] == 10 && ip[1] == 0 && ip[2] == 2 {
+    let c = cfg();
+    let same_subnet = (0..4).all(|i| ip[i] & c.mask[i] == c.ip[i] & c.mask[i]);
+    if same_subnet {
         ip
     } else {
-        GATEWAY
+        c.gateway
     }
 }
 
@@ -474,7 +566,7 @@ fn arp_rx(p: &[u8]) {
     spa.copy_from_slice(&p[14..18]);
     learn(spa, sha);
 
-    if op == 1 && &p[24..28] == &MY_IP[..] {
+    if op == 1 && p[24..28] == cfg().ip {
         send_arp(2, sha, sha, spa);
     }
     if op == 2 {
@@ -488,39 +580,102 @@ fn arp_rx(p: &[u8]) {
     }
 }
 
+/// Ask for `hop`'s address and wait for the reply. Only for command
+/// context, never from frame handling.
+fn resolve(hop: [u8; 4]) -> Option<[u8; 6]> {
+    if let Some(mac) = lookup(hop) {
+        return Some(mac);
+    }
+    for _ in 0..3 {
+        send_arp(1, BCAST, [0; 6], hop);
+        if wait_until(500, || lookup(hop).is_some()) {
+            return lookup(hop);
+        }
+    }
+    None
+}
+
+// ---- IPv4 ----------------------------------------------------------------
+
+/// Send an IP packet if the next hop's address is already known. Used from
+/// frame handling, which must not wait. Asks for the address if it is not known.
+fn ip_send_now(dst: [u8; 4], proto: u8, payload: &[u8]) -> bool {
+    let hop = next_hop(dst);
+    let mac = match lookup(hop) {
+        Some(m) => m,
+        None => {
+            send_arp(1, BCAST, [0; 6], hop);
+            return false;
+        }
+    };
+    let packet = np::build_ipv4(cfg().ip, dst, proto, payload);
+    send(&eth(mac, 0x0800, &packet))
+}
+
+/// Send an IP packet, waiting for the next hop's address if needed.
+fn ip_send(dst: [u8; 4], proto: u8, payload: &[u8]) -> Result<(), &'static str> {
+    let mac = resolve(next_hop(dst)).ok_or("no answer from the gateway")?;
+    let packet = np::build_ipv4(cfg().ip, dst, proto, payload);
+    if send(&eth(mac, 0x0800, &packet)) {
+        Ok(())
+    } else {
+        Err("the network card did not take the packet")
+    }
+}
+
+/// Broadcast a UDP datagram from 0.0.0.0, which DHCP needs before it has an address.
+fn broadcast_udp(sport: u16, dport: u16, data: &[u8]) -> bool {
+    let seg = np::build_udp(ZERO_IP, BCAST_IP, sport, dport, data);
+    let packet = np::build_ipv4(ZERO_IP, BCAST_IP, np::PROTO_UDP, &seg);
+    send(&eth(BCAST, 0x0800, &packet))
+}
+
 fn ipv4_rx(src_mac: [u8; 6], p: &[u8]) {
-    if p.len() < 20 {
+    let ip = match np::parse_ipv4(p) {
+        Some(ip) => ip,
+        None => return,
+    };
+    if ip.src != ZERO_IP {
+        learn(ip.src, src_mac);
+    }
+    let me = cfg().ip;
+    match ip.proto {
+        1 if ip.dst == me => icmp_rx(ip.src, src_mac, ip.payload),
+        np::PROTO_UDP => {
+            if let Some(u) = np::parse_udp(ip.src, ip.dst, ip.payload) {
+                match u.dport {
+                    68 => dhcp_rx(u.data),
+                    DNS_SPORT => dns_rx(u.data),
+                    _ => {}
+                }
+            }
+        }
+        np::PROTO_TCP if ip.dst == me => tcp_rx(ip.src, ip.payload),
+        _ => {}
+    }
+}
+
+fn icmp_rx(src: [u8; 4], src_mac: [u8; 6], icmp: &[u8]) {
+    if icmp.len() < 8 {
         return;
     }
-    let ihl = ((p[0] & 0x0F) as usize) * 4;
-    if ihl < 20 || p.len() < ihl {
-        return;
-    }
-    if &p[16..20] != &MY_IP[..] {
-        return;
-    }
-    let total = (u16::from_be_bytes([p[2], p[3]]) as usize).min(p.len());
-    if total < ihl + 8 || p[9] != 1 {
-        return;
-    }
-    let src = [p[12], p[13], p[14], p[15]];
-    learn(src, src_mac);
-    let icmp = &p[ihl..total];
     match icmp[0] {
         8 => {
             let mut r = icmp.to_vec();
             r[0] = 0;
             r[2] = 0;
             r[3] = 0;
-            let c = checksum(&r);
+            let c = np::checksum(&r);
             r[2..4].copy_from_slice(&c.to_be_bytes());
-            let ip = ipv4(1, src, &r);
-            send(&eth(src_mac, 0x0800, &ip));
+            let packet = np::build_ipv4(cfg().ip, src, 1, &r);
+            send(&eth(src_mac, 0x0800, &packet));
         }
         0 => echo_reply(src, icmp),
         _ => {}
     }
 }
+
+// ---- Ping ----------------------------------------------------------------
 
 fn echo_reply(src: [u8; 4], icmp: &[u8]) {
     let seq = u16::from_be_bytes([icmp[6], icmp[7]]);
@@ -549,9 +704,9 @@ fn send_echo(target: [u8; 4], seq: u16) {
     m.extend_from_slice(&ICMP_ID.to_be_bytes());
     m.extend_from_slice(&seq.to_be_bytes());
     m.extend_from_slice(b"anarchyos");
-    let c = checksum(&m);
+    let c = np::checksum(&m);
     m[2..4].copy_from_slice(&c.to_be_bytes());
-    send(&eth(mac, 0x0800, &ipv4(1, target, &m)));
+    send(&eth(mac, 0x0800, &np::build_ipv4(cfg().ip, target, 1, &m)));
 }
 
 fn parse_ip(s: &str) -> Option<[u8; 4]> {
@@ -601,15 +756,354 @@ fn ping(arg: &str) {
     }
 }
 
+// ---- UDP and DHCP --------------------------------------------------------
+
+fn dhcp_rx(data: &[u8]) {
+    let r = np::parse_dhcp(data, unsafe { DHCP_XID }, nic().mac);
+    if let Some(r) = r {
+        unsafe { DHCP_INBOX = Some(r) };
+    }
+}
+
+fn inbox_has(kind: u8) -> bool {
+    unsafe { (*addr_of!(DHCP_INBOX)).as_ref().map_or(false, |r| r.msg == kind) }
+}
+
+fn take_inbox() -> Option<np::DhcpReply> {
+    unsafe { (*addr_of_mut!(DHCP_INBOX)).take() }
+}
+
+/// Run the DHCP exchange and adopt the address it gives us.
+fn dhcp() -> Result<(), &'static str> {
+    let mac = nic().mac;
+    let xid = random();
+    unsafe {
+        DHCP_XID = xid;
+        DHCP_INBOX = None;
+    }
+
+    let mut offer = None;
+    for _ in 0..3 {
+        broadcast_udp(68, 67, &np::build_dhcp(mac, xid, np::DHCP_DISCOVER, None, None));
+        if wait_until(1000, || inbox_has(np::DHCP_OFFER)) {
+            offer = take_inbox();
+            break;
+        }
+    }
+    let offer = offer.ok_or("no DHCP offer arrived")?;
+
+    let mut ack = None;
+    for _ in 0..3 {
+        let request = np::build_dhcp(mac, xid, np::DHCP_REQUEST, Some(offer.yiaddr), Some(offer.server));
+        broadcast_udp(68, 67, &request);
+        if wait_until(1000, || inbox_has(np::DHCP_ACK)) {
+            ack = take_inbox();
+            break;
+        }
+    }
+    let ack = ack.ok_or("the DHCP server did not confirm the address")?;
+
+    let c = cfg();
+    c.ip = ack.yiaddr;
+    c.mask = ack.mask;
+    c.gateway = if ack.router != ZERO_IP { ack.router } else { ack.server };
+    c.dns = if ack.dns != ZERO_IP { ack.dns } else { c.gateway };
+    c.from_dhcp = true;
+    send_arp(1, BCAST, [0; 6], c.gateway);
+    Ok(())
+}
+
+fn startup_dhcp() {
+    match dhcp() {
+        Ok(()) => {
+            let c = *cfg();
+            terminal::print(&format!("network: address {} via DHCP", fmt_ip(c.ip)));
+        }
+        Err(e) => {
+            let c = *cfg();
+            terminal::print(&format!("network: {} (using {})", e, fmt_ip(c.ip)));
+        }
+    }
+}
+
+// ---- DNS -----------------------------------------------------------------
+
+fn dns_rx(data: &[u8]) {
+    let want = unsafe { DNS_WANT };
+    if let Some(id) = want {
+        if let Some(ip) = np::parse_dns_a(data, id) {
+            unsafe {
+                DNS_ANSWER = Some(ip);
+                DNS_WANT = None;
+            }
+        }
+    }
+}
+
+/// Look up an IPv4 address for `name`. A literal address is returned as is.
+fn resolve_name(name: &str) -> Result<[u8; 4], &'static str> {
+    if let Some(ip) = parse_ip(name) {
+        return Ok(ip);
+    }
+    let dns = cfg().dns;
+    for _ in 0..2 {
+        let id = (random() & 0xFFFF) as u16;
+        unsafe {
+            DNS_WANT = Some(id);
+            DNS_ANSWER = None;
+        }
+        let query = np::build_dns_query(id, name);
+        let seg = np::build_udp(cfg().ip, dns, DNS_SPORT, 53, &query);
+        ip_send(dns, np::PROTO_UDP, &seg)?;
+        if wait_until(2000, || unsafe { (*addr_of!(DNS_ANSWER)).is_some() }) {
+            let answer = unsafe { (*addr_of_mut!(DNS_ANSWER)).take() };
+            unsafe { DNS_WANT = None };
+            return answer.ok_or("no address in the answer");
+        }
+    }
+    unsafe { DNS_WANT = None };
+    Err("the name did not resolve")
+}
+
+// ---- TCP -----------------------------------------------------------------
+
+fn seq_lt(a: u32, b: u32) -> bool {
+    (b.wrapping_sub(a) as i32) > 0
+}
+
+fn seq_le(a: u32, b: u32) -> bool {
+    a == b || seq_lt(a, b)
+}
+
+fn tcp_rx(src: [u8; 4], seg: &[u8]) {
+    let t = match np::parse_tcp(src, cfg().ip, seg) {
+        Some(t) => t,
+        None => return,
+    };
+    let c = match conn() {
+        Some(c) => c,
+        None => return,
+    };
+    if t.dport != c.lport || t.sport != c.rport || src != c.rip {
+        return;
+    }
+    if t.flags & np::TCP_RST != 0 {
+        c.st = TcpState::Reset;
+        return;
+    }
+    match c.st {
+        TcpState::SynSent => {
+            let syn_ack = np::TCP_SYN | np::TCP_ACK;
+            if t.flags & syn_ack == syn_ack && t.ack == c.snd_nxt {
+                c.rcv_nxt = t.seq.wrapping_add(1);
+                c.snd_una = t.ack;
+                c.st = TcpState::Established;
+                send_ack(c);
+            }
+        }
+        TcpState::Established => {
+            if t.flags & np::TCP_ACK != 0 && seq_lt(c.snd_una, t.ack) && seq_le(t.ack, c.snd_nxt) {
+                c.snd_una = t.ack;
+            }
+            let mut ack_needed = false;
+            if !t.data.is_empty() {
+                ack_needed = true;
+                if t.seq == c.rcv_nxt {
+                    c.rx.extend_from_slice(t.data);
+                    c.rcv_nxt = c.rcv_nxt.wrapping_add(t.data.len() as u32);
+                }
+            }
+            if t.flags & np::TCP_FIN != 0 {
+                ack_needed = true;
+                if t.seq.wrapping_add(t.data.len() as u32) == c.rcv_nxt {
+                    c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
+                    c.fin = true;
+                }
+            }
+            if ack_needed {
+                send_ack(c);
+            }
+        }
+        TcpState::Reset => {}
+    }
+}
+
+fn send_ack(c: &Conn) {
+    let seg = np::build_tcp(
+        cfg().ip,
+        c.rip,
+        c.lport,
+        c.rport,
+        c.snd_nxt,
+        c.rcv_nxt,
+        np::TCP_ACK,
+        None,
+        TCP_WINDOW,
+        &[],
+    );
+    ip_send_now(c.rip, np::PROTO_TCP, &seg);
+}
+
+fn tcp_connect(ip: [u8; 4], port: u16) -> Result<(), &'static str> {
+    let isn = random();
+    let lport = 49152 + (random() % 16000) as u16;
+    unsafe {
+        CONN = Some(Conn {
+            st: TcpState::SynSent,
+            lport,
+            rip: ip,
+            rport: port,
+            snd_una: isn,
+            snd_nxt: isn.wrapping_add(1),
+            rcv_nxt: 0,
+            rx: Vec::new(),
+            fin: false,
+        });
+    }
+    let result: Result<(), &'static str> = (|| {
+        for _ in 0..3 {
+            let syn = np::build_tcp(cfg().ip, ip, lport, port, isn, 0, np::TCP_SYN, Some(1460), TCP_WINDOW, &[]);
+            ip_send(ip, np::PROTO_TCP, &syn)?;
+            if wait_until(1000, || conn_state() != TcpState::SynSent) {
+                break;
+            }
+        }
+        match conn_state() {
+            TcpState::Established => Ok(()),
+            TcpState::Reset => Err("the connection was refused"),
+            TcpState::SynSent => Err("the connection timed out"),
+        }
+    })();
+    if result.is_err() {
+        unsafe { CONN = None };
+    }
+    result
+}
+
+/// Send data reliably, one chunk at a time, resending until it is acknowledged.
+fn tcp_send(data: &[u8]) -> Result<(), &'static str> {
+    for chunk in data.chunks(TCP_CHUNK) {
+        let seq = conn().ok_or("no connection")?.snd_nxt;
+        let end = seq.wrapping_add(chunk.len() as u32);
+        conn().ok_or("no connection")?.snd_nxt = end;
+        let mut acked = false;
+        for _ in 0..5 {
+            let c = conn().ok_or("no connection")?;
+            let seg = np::build_tcp(
+                cfg().ip,
+                c.rip,
+                c.lport,
+                c.rport,
+                seq,
+                c.rcv_nxt,
+                np::TCP_ACK | np::TCP_PSH,
+                None,
+                TCP_WINDOW,
+                chunk,
+            );
+            let rip = c.rip;
+            ip_send(rip, np::PROTO_TCP, &seg)?;
+            if wait_until(1000, || conn().map_or(true, |c| seq_le(end, c.snd_una) || c.st == TcpState::Reset)) {
+                acked = true;
+                break;
+            }
+        }
+        if !acked || conn_state() == TcpState::Reset {
+            return Err("the server stopped answering");
+        }
+    }
+    Ok(())
+}
+
+/// Wait for the server to close its side, then return everything it sent.
+fn tcp_wait_close(timeout_ms: u64) -> Result<Vec<u8>, &'static str> {
+    let ok = wait_until(timeout_ms, || conn().map_or(true, |c| c.fin || c.st == TcpState::Reset));
+    let c = conn().ok_or("no connection")?;
+    if c.fin {
+        Ok(core::mem::take(&mut c.rx))
+    } else if ok {
+        Err("the connection was reset")
+    } else {
+        Err("timed out waiting for the reply")
+    }
+}
+
+fn tcp_close() {
+    if let Some(c) = conn() {
+        let seg = np::build_tcp(
+            cfg().ip,
+            c.rip,
+            c.lport,
+            c.rport,
+            c.snd_nxt,
+            c.rcv_nxt,
+            np::TCP_FIN | np::TCP_ACK,
+            None,
+            TCP_WINDOW,
+            &[],
+        );
+        let rip = c.rip;
+        ip_send_now(rip, np::PROTO_TCP, &seg);
+    }
+    unsafe { CONN = None };
+}
+
+// ---- Commands ------------------------------------------------------------
+
+/// Download a plain HTTP URL into a file on the drive.
+fn fetch_to(url: &str, file: &str) -> Result<String, &'static str> {
+    if !file.starts_with('/') {
+        return Err("give the drive path in full, like /Documents/file.txt");
+    }
+    if !nic().up {
+        return Err("no network device");
+    }
+    if !fs::mounted() {
+        return Err("unlock the drive first");
+    }
+    let (host, port, path) = np::parse_url(url)?;
+    let ip = resolve_name(&host)?;
+    tcp_connect(ip, port)?;
+    let raw = tcp_send(&np::build_http_get(&host, &path))
+        .and_then(|()| tcp_wait_close(30_000));
+    tcp_close();
+    let raw = raw?;
+    let response = np::parse_response(&raw).ok_or("the reply was not a complete HTTP response")?;
+    if response.status != 200 {
+        return Ok(format!("the server answered HTTP {}, nothing saved", response.status));
+    }
+    fs::write(file, &response.body).map_err(|_| "could not write the file to the drive")?;
+    Ok(format!("saved {} bytes to {}", response.body.len(), file))
+}
+
+fn fetch(rest: &str) {
+    let mut parts = rest.split_whitespace();
+    let (url, file) = match (parts.next(), parts.next()) {
+        (Some(url), Some(file)) => (url, file),
+        _ => {
+            terminal::print("usage: fetch http://host/path /Documents/file");
+            return;
+        }
+    };
+    terminal::print(&format!("fetching {} ...", url));
+    match fetch_to(url, file) {
+        Ok(msg) => terminal::print(&msg),
+        Err(e) => terminal::print(&format!("fetch failed: {}", e)),
+    }
+}
+
 fn status() {
     let n = nic();
     terminal::print(&format!("link:    {}", if n.up { "up" } else { "down" }));
     if !n.up {
         return;
     }
+    let c = *cfg();
     terminal::print(&format!("mac:     {}", fmt_mac(n.mac)));
-    terminal::print(&format!("ip:      {}", fmt_ip(MY_IP)));
-    terminal::print(&format!("gateway: {}", fmt_ip(GATEWAY)));
+    terminal::print(&format!("ip:      {} ({})", fmt_ip(c.ip), if c.from_dhcp { "DHCP" } else { "default" }));
+    terminal::print(&format!("mask:    {}", fmt_ip(c.mask)));
+    terminal::print(&format!("gateway: {}", fmt_ip(c.gateway)));
+    terminal::print(&format!("dns:     {}", fmt_ip(c.dns)));
     let cached = n.arp.iter().flatten().count();
     terminal::print(&format!("arp:     {} entries", cached));
 }
@@ -621,12 +1115,36 @@ pub fn command(name: &str, rest: &str) -> bool {
             true
         }
         "arp" => {
-            send_arp(1, BCAST, [0; 6], GATEWAY);
+            send_arp(1, BCAST, [0; 6], cfg().gateway);
             terminal::print("arp: request sent for gateway");
             true
         }
         "ping" => {
             ping(rest);
+            true
+        }
+        "dhcp" => {
+            if !nic().up {
+                terminal::print("dhcp: no network device");
+            } else {
+                startup_dhcp();
+            }
+            true
+        }
+        "dns" => {
+            let name = rest.trim();
+            if name.is_empty() {
+                terminal::print("usage: dns <name>");
+            } else {
+                match resolve_name(name) {
+                    Ok(ip) => terminal::print(&format!("{} = {}", name, fmt_ip(ip))),
+                    Err(e) => terminal::print(&format!("dns: {}", e)),
+                }
+            }
+            true
+        }
+        "fetch" => {
+            fetch(rest);
             true
         }
         _ => false,
@@ -635,7 +1153,7 @@ pub fn command(name: &str, rest: &str) -> bool {
 
 pub fn renew() {
     if nic().up {
-        send_arp(1, BCAST, [0; 6], GATEWAY);
+        startup_dhcp();
     }
 }
 
@@ -650,11 +1168,12 @@ pub struct Info {
 
 pub fn info() -> Info {
     let n = nic();
+    let c = *cfg();
     Info {
         up: n.up,
         mac: fmt_mac(n.mac),
-        ip: fmt_ip(MY_IP),
-        gateway: fmt_ip(GATEWAY),
+        ip: fmt_ip(c.ip),
+        gateway: fmt_ip(c.gateway),
         arp_entries: n.arp.iter().flatten().count(),
     }
 }

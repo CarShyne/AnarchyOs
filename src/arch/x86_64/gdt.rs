@@ -5,9 +5,13 @@ use crate::arch::x86_64::tss;
 use core::arch::asm;
 use core::ptr::addr_of_mut;
 
+// Layout chosen so that `sysret` lands on the user selectors: with STAR
+// holding 0x10, sysret loads CS = 0x10 + 16 and SS = 0x10 + 8, both with RPL 3.
 pub const KERNEL_CODE: u16 = 0x08;
 pub const KERNEL_DATA: u16 = 0x10;
-pub const TSS_SELECTOR: u16 = 0x18;
+pub const USER_DATA: u16 = 0x1B; // index 3, RPL 3
+pub const USER_CODE: u16 = 0x23; // index 4, RPL 3
+pub const TSS_SELECTOR: u16 = 0x28;
 
 /// Layout the CPU expects for lgdt and lidt.
 #[repr(C, packed)]
@@ -18,10 +22,12 @@ pub struct DescriptorTablePointer {
 
 // This must be writable. The CPU sets Accessed bits when segments load,
 // and the Busy bit when ltr runs. Both are writes into the table.
-static mut GDT: [u64; 5] = [
+static mut GDT: [u64; 7] = [
     0,                     // null descriptor, required
     0x00AF_9B00_0000_FFFF, // kernel code: present, ring 0, executable, long mode, accessed
     0x00CF_9300_0000_FFFF, // kernel data: present, ring 0, writable, accessed
+    0x00CF_F300_0000_FFFF, // user data: present, ring 3, writable
+    0x00AF_FB00_0000_FFFF, // user code: present, ring 3, executable, long mode
     0,                     // TSS low half, filled in at init
     0,                     // TSS high half, filled in at init
 ];
@@ -44,8 +50,8 @@ pub fn init() {
         let gdt = &mut *addr_of_mut!(GDT);
 
         let (low, high) = tss_descriptor(tss::address(), tss::size() - 1);
-        gdt[3] = low;
-        gdt[4] = high;
+        gdt[5] = low;
+        gdt[6] = high;
 
         let ptr = DescriptorTablePointer {
             limit: (gdt.len() * core::mem::size_of::<u64>() - 1) as u16,

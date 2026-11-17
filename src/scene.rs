@@ -2,7 +2,9 @@
 //!
 //! Two screen-sized pictures are kept ready: the wallpaper itself, and a
 //! blurred copy that translucent windows use as frosted glass. Blurring
-//! once here means windows cost no more to draw than a flat colour.
+//! once here means windows cost no more to draw than a flat colour. Wallpaper
+//! mods (scanlines, vignette, grain, tint) are also baked in here, so they
+//! add nothing to the cost of drawing each frame.
 
 use crate::framebuffer as fb;
 use crate::gfx;
@@ -13,7 +15,6 @@ use alloc::vec::Vec;
 use core::ptr::addr_of_mut;
 
 pub const GRADIENT_TOP: u32 = 0x0008_090C;
-const BLUR_RADIUS: usize = 14;
 
 /// The gradient fades from near-black into a dark shade of the accent.
 pub fn gradient_bottom() -> u32 {
@@ -56,8 +57,14 @@ pub fn apply() {
     s.frost = Vec::new();
     s.scaled = false;
 
+    let mods = theme::wallpaper_mods();
     match current() {
-        Some(img) if (img.w as usize, img.h as usize) == (w, h) => {}
+        Some(img) if (img.w as usize, img.h as usize) == (w, h) => {
+            // A mod needs its own copy to change, so the built-in picture is left alone.
+            if mods {
+                s.base = img.px.to_vec();
+            }
+        }
         Some(img) => {
             s.base = cover(img, w, h);
             s.scaled = true;
@@ -73,11 +80,82 @@ pub fn apply() {
         }
     }
 
+    if mods {
+        mod_pass(&mut scene().base, w, h);
+    }
+
+    let radius = theme::blur_radius();
     let mut frost = Vec::new();
     frost.extend_from_slice(wallpaper_pixels(scene(), w, h));
-    box_blur(&mut frost, w, h, BLUR_RADIUS);
-    box_blur(&mut frost, w, h, BLUR_RADIUS);
+    if radius > 0 {
+        box_blur(&mut frost, w, h, radius);
+        box_blur(&mut frost, w, h, radius);
+    }
     scene().frost = frost;
+}
+
+/// Apply the wallpaper mods in place. Each one is a multiplier per pixel,
+/// so the whole pass is one walk over the picture.
+fn mod_pass(px: &mut [u32], w: usize, h: usize) {
+    if px.len() != w * h {
+        return;
+    }
+    let c = theme::cfg();
+    let (scanlines, vignette, grain) = (c.scanlines, c.vignette, c.grain);
+    let wash = if c.desk_tint > 0 { theme::accent() } else { 0 };
+    let wash_t = c.desk_tint.min(100) * 255 / 100;
+
+    let (cx, cy) = (w as i64 / 2, h as i64 / 2);
+    let max_d2 = (cx * cx + cy * cy).max(1);
+    // A tiny xorshift generator. The grain only needs to look random.
+    let mut seed: u32 = 0x2545_F491;
+
+    for y in 0..h {
+        let dy = y as i64 - cy;
+        for x in 0..w {
+            let i = y * w + x;
+            let mut f: u32 = 256;
+            if scanlines && y % 3 == 2 {
+                f = 190;
+            }
+            if vignette {
+                let dx = x as i64 - cx;
+                let t = ((dx * dx + dy * dy) * 256 / max_d2).min(256) as u32;
+                // The corners lose up to 110 of 256 brightness.
+                let darken = t * t / 256 * 110 / 256;
+                f = f * (256 - darken) / 256;
+            }
+
+            let p = px[i];
+            let (mut r, mut g, mut b) = ((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF);
+            r = r * f / 256;
+            g = g * f / 256;
+            b = b * f / 256;
+
+            if wash != 0 {
+                let m = gfx::mix(
+                    (r << 16) | (g << 8) | b,
+                    wash,
+                    wash_t,
+                );
+                r = (m >> 16) & 0xFF;
+                g = (m >> 8) & 0xFF;
+                b = m & 0xFF;
+            }
+
+            if grain {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                let n = (seed % 13) as i32 - 6;
+                r = (r as i32 + n).clamp(0, 255) as u32;
+                g = (g as i32 + n).clamp(0, 255) as u32;
+                b = (b as i32 + n).clamp(0, 255) as u32;
+            }
+
+            px[i] = (r << 16) | (g << 8) | b;
+        }
+    }
 }
 
 fn wallpaper_pixels(s: &'static Scene, w: usize, h: usize) -> &'static [u32] {

@@ -3,7 +3,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::ptr::addr_of_mut;
 
-pub const FILE: &str = "settings.cfg";
+pub const FILE: &str = "/System/settings.cfg";
 
 static mut DISK_OK: bool = false;
 static mut WARNED: bool = false;

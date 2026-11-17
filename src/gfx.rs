@@ -403,6 +403,56 @@ pub fn image_round(x: i32, y: i32, img: &Img, r: i32) {
     }
 }
 
+/// Draw a full-colour icon as a rounded tile. Transparent pixels in the
+/// icon stay transparent, and `alpha` fades the whole tile.
+pub fn art_round(x: i32, y: i32, img: &Img, r: i32, alpha: u32) {
+    art_scaled(x, y, img, img.w as i32, r, alpha);
+}
+
+/// As `art_round`, but drawn `size` pixels square. The picture is sampled
+/// nearest-neighbour, so magnified dock icons stay crisp at any size.
+pub fn art_scaled(x: i32, y: i32, img: &Img, size: i32, r: i32, alpha: u32) {
+    let s = surf();
+    let (iw, ih) = (img.w as i32, img.h as i32);
+    let size = size.max(1);
+    let r = clamp_radius(r, size, size);
+    let table = cov(r as usize);
+    let ga = a256(alpha);
+    for row in 0..size {
+        let py = y + row;
+        if !s.row_visible(py) {
+            continue;
+        }
+        let cr = if row < r {
+            row
+        } else if row >= size - r {
+            size - 1 - row
+        } else {
+            -1
+        };
+        let sy = (row * ih / size).min(ih - 1);
+        for col in 0..size {
+            let cc = if col < r {
+                col
+            } else if col >= size - r {
+                size - 1 - col
+            } else {
+                -1
+            };
+            let cv = if cr >= 0 && cc >= 0 { table[(cr * r + cc) as usize] as u32 } else { 255 };
+            let sx = (col * iw / size).min(iw - 1);
+            let p = img.px[(sy * iw + sx) as usize];
+            let pa = p >> 24;
+            if cv != 0 && pa != 0 {
+                let a = ((cv + (cv >> 7)) * (pa + (pa >> 7)) >> 8) * ga >> 8;
+                if a != 0 {
+                    s.dot(x + col, py, p & 0x00FF_FFFF, a);
+                }
+            }
+        }
+    }
+}
+
 /// Draw a single-colour icon.
 pub fn icon(x: i32, y: i32, m: &Mask, color: u32) {
     icon_a(x, y, m, color, 255);

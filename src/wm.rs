@@ -5,14 +5,18 @@
 //! from the wallpaper up into the back buffer, then copies that rectangle
 //! to the screen, so nothing ever leaves a trail.
 
+use crate::anarchyai;
 use crate::clock;
+use crate::files_app;
 use crate::framebuffer as fb;
 use crate::gfx;
 use crate::image::{self, icon, BODY, LABEL, MARK_22, MARK_48, SMALL, STRONG, TITLE, WORDMARK};
+use crate::lock;
 use crate::net;
 use crate::pci;
 use crate::ps2;
 use crate::scene;
+use crate::settings;
 use crate::settings_app::{self, Outcome};
 use crate::terminal;
 use crate::theme::{self, FAINT, MUTED, TEXT, WHITE};
@@ -25,6 +29,8 @@ pub enum Kind {
     Keys,
     Terminal,
     Settings,
+    Files,
+    AnarchyAi,
 }
 
 #[derive(Clone, Copy)]
@@ -45,6 +51,8 @@ struct App {
     name: &'static str,
     window: Option<usize>,
     icon: usize,
+    /// Name of a full-colour icon in assets/icons/apps. Empty uses the gradient tile.
+    art: &'static str,
     /// Tile gradient, top and bottom.
     top: u32,
     bottom: u32,
@@ -54,7 +62,9 @@ const WELCOME: usize = 0;
 const KEYS: usize = 1;
 const TERMINAL: usize = 2;
 const SETTINGS: usize = 3;
-const MAX_WINDOWS: usize = 4;
+const FILES: usize = 4;
+const ANARCHYAI: usize = 5;
+const MAX_WINDOWS: usize = 6;
 
 const TITLE_H: i32 = 36;
 const GRIP: i32 = 18;
@@ -63,15 +73,23 @@ const SHADOW: i32 = 13;
 
 const TOP_H: i32 = 30;
 
-const DOCK_SLOTS: usize = 5;
+/// Most apps the dock can hold, pinned or running, not counting the launcher.
+const DOCK_MAX: usize = 8;
 const TILE: i32 = 48;
 const DOCK_PAD: i32 = 10;
 const TILE_GAP: i32 = 10;
 const DOCK_H: i32 = TILE + 2 * DOCK_PAD + 4;
 const DOCK_BOTTOM_GAP: i32 = 12;
+/// How far a press may move before it counts as a drag, not a click.
+const DRAG_START: i32 = 6;
+/// How far above the dock's top edge a dragged icon must be to be removed.
+const DROP_REACH: i32 = 28;
+const MENU_W: i32 = 196;
+const MENU_ROW: i32 = 30;
+const MENU_PAD: i32 = 6;
 
 const DRAWER_W: i32 = 600;
-const DRAWER_H: i32 = 320;
+const DRAWER_H: i32 = 420;
 const DRAWER_COLS: usize = 4;
 const CELL_W: i32 = 132;
 const CELL_H: i32 = 116;
@@ -82,16 +100,71 @@ const CURSOR_H: i32 = 19;
 /// Timer ticks between cursor blinks: 50 ticks at 100 Hz is half a second.
 const BLINK_TICKS: u64 = 50;
 
-const APPS: [App; 8] = [
-    App { name: "Welcome", window: Some(WELCOME), icon: icon::SPARKLES, top: 0x00FF_4D6D, bottom: 0x00C9_0A38 },
-    App { name: "Keys", window: Some(KEYS), icon: icon::KEYBOARD, top: 0x002D_D4BF, bottom: 0x000F_766E },
-    App { name: "Terminal", window: Some(TERMINAL), icon: icon::TERMINAL, top: 0x003A_3D46, bottom: 0x0016_171C },
-    App { name: "Settings", window: Some(SETTINGS), icon: icon::SETTINGS, top: 0x008B_93A1, bottom: 0x004B_5563 },
-    App { name: "Files", window: None, icon: icon::FOLDER, top: 0x0060_A5FA, bottom: 0x001D_4ED8 },
-    App { name: "Monitor", window: None, icon: icon::ACTIVITY, top: 0x004A_DE80, bottom: 0x0015_803D },
-    App { name: "Network", window: None, icon: icon::GLOBE, top: 0x0038_BDF8, bottom: 0x0003_69A1 },
-    App { name: "Notes", window: None, icon: icon::NOTES, top: 0x00FB_BF24, bottom: 0x00B4_5309 },
+/// Dock magnification: how much an icon can grow, and how far from it the
+/// pointer still reaches.
+const MAG_GROW: i32 = 20;
+const MAG_RANGE: i32 = 90;
+/// How far a hovered icon lifts.
+const HOVER_LIFT: i32 = 6;
+/// How far above the dock its effects can reach. Damage uses this too.
+const BAND_UP: i32 = 48;
+/// The launch bounce moves one step every BOUNCE_STEP ticks, in pixels up.
+const BOUNCE_STEP: u64 = 5;
+const BOUNCE: [i32; 16] = [0, 6, 12, 18, 22, 24, 22, 18, 12, 8, 4, 8, 4, 2, 1, 0];
+const BOUNCE_TICKS: u64 = BOUNCE_STEP * BOUNCE.len() as u64;
+
+/// Every app, in drawer order. An app with no window is shown but not ready yet.
+const APPS: [App; 9] = [
+    App { name: "Welcome", window: Some(WELCOME), icon: icon::SPARKLES, art: "", top: 0x00FF_4D6D, bottom: 0x00C9_0A38 },
+    App { name: "Keys", window: Some(KEYS), icon: icon::KEYBOARD, art: "", top: 0x002D_D4BF, bottom: 0x000F_766E },
+    App { name: "Terminal", window: Some(TERMINAL), icon: icon::TERMINAL, art: "", top: 0x003A_3D46, bottom: 0x0016_171C },
+    App { name: "Settings", window: Some(SETTINGS), icon: icon::SETTINGS, art: "", top: 0x008B_93A1, bottom: 0x004B_5563 },
+    App { name: "Files", window: Some(FILES), icon: icon::FOLDER, art: "Finder", top: 0x0060_A5FA, bottom: 0x001D_4ED8 },
+    App { name: "Monitor", window: None, icon: icon::ACTIVITY, art: "Task manager", top: 0x004A_DE80, bottom: 0x0015_803D },
+    App { name: "Network", window: None, icon: icon::GLOBE, art: "Connections", top: 0x0038_BDF8, bottom: 0x0003_69A1 },
+    App { name: "Notes", window: None, icon: icon::NOTES, art: "Lightbulb", top: 0x00FB_BF24, bottom: 0x00B4_5309 },
+    App { name: "AnarchyAi", window: Some(ANARCHYAI), icon: icon::SPARKLES, art: "AnarchyAi", top: 0x00FF_1F4B, bottom: 0x00A0_0C2E },
 ];
+
+/// Apps pinned to the dock by default, as indexes into APPS.
+const DEFAULT_PINS: [usize; DOCK_MAX] = [4, 0, 2, 3, 0, 0, 0, 0];
+const DEFAULT_PIN_COUNT: usize = 4;
+
+/// A press on the dock, held until the button is released. It is a click
+/// if the pointer stayed put, and a drag if it moved.
+#[derive(Clone, Copy)]
+struct DockPress {
+    /// Which dock slot was pressed. Slot 0 is the app drawer button.
+    slot: usize,
+    /// The app under the press, or None for the app drawer button.
+    app: Option<usize>,
+    origin_x: i32,
+    origin_y: i32,
+    x: i32,
+    y: i32,
+    moved: bool,
+}
+
+/// The right-click menu for a dock icon, opened at the pointer.
+#[derive(Clone, Copy)]
+struct Menu {
+    app: usize,
+    x: i32,
+    y: i32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Action {
+    Open,
+    Hide,
+    Pin,
+    Unpin,
+    Close,
+}
+
+fn app_window(app: usize) -> usize {
+    APPS[app].window.unwrap_or(0)
+}
 
 struct State {
     windows: [Window; MAX_WINDOWS],
@@ -108,8 +181,20 @@ struct State {
     in_settings: bool,
     drawer: bool,
     settings: settings_app::State,
+    files: files_app::State,
+    anarchyai: anarchyai::State,
     /// Last clock value drawn in the menu bar.
     clock_stamp: u64,
+    /// The latest timer tick, used by the animations.
+    now: u64,
+    /// A dock icon is bouncing: its slot, and the tick it started on.
+    bounce: Option<(usize, u64)>,
+    /// Apps pinned to the dock, in order, as indexes into APPS.
+    pins: [usize; DOCK_MAX],
+    pin_count: usize,
+    dock_press: Option<DockPress>,
+    menu: Option<Menu>,
+    right: bool,
 }
 
 const fn window(rect: Rect, title: &'static str, kind: Kind, open: bool, min_w: i32, min_h: i32) -> Window {
@@ -122,8 +207,10 @@ static mut STATE: State = State {
         window(Rect::new(720, 120, 440, 210), "Keys", Kind::Keys, false, 320, 180),
         window(Rect::new(150, 380, 760, 340), "Terminal", Kind::Terminal, false, 380, 220),
         window(Rect::new(190, 80, 900, 620), "Settings", Kind::Settings, false, 760, 520),
+        window(Rect::new(300, 110, 640, 420), "Files", Kind::Files, false, 420, 300),
+        window(Rect::new(200, 96, 900, 600), "AnarchyAi", Kind::AnarchyAi, false, 560, 380),
     ],
-    order: [WELCOME, 0, 0, 0],
+    order: [WELCOME, 0, 0, 0, 0, 0],
     count: 1,
     cur_x: 0,
     cur_y: 0,
@@ -133,7 +220,16 @@ static mut STATE: State = State {
     in_settings: false,
     drawer: false,
     settings: settings_app::State::new(),
+    files: files_app::State::new(),
+    anarchyai: anarchyai::State::new(),
     clock_stamp: 0,
+    now: 0,
+    bounce: None,
+    pins: DEFAULT_PINS,
+    pin_count: DEFAULT_PIN_COUNT,
+    dock_press: None,
+    menu: None,
+    right: false,
 };
 
 // Only the main loop touches this state.
@@ -171,7 +267,21 @@ fn fit(r: Rect, screen: Rect) -> Rect {
 
 /// Called from the main loop on every timer tick, 100 times a second.
 pub fn tick(t: u64) {
-    if t % BLINK_TICKS != 0 {
+    if !lock::showing() {
+        let s = state();
+        s.now = t;
+        if let Some((_, start)) = s.bounce {
+            let done = t.wrapping_sub(start) >= BOUNCE_TICKS;
+            if done {
+                s.bounce = None;
+            }
+            // Repaint the dock on each bounce step, and once more when it lands.
+            if t % BOUNCE_STEP == 0 || done {
+                render(s, dock_band(s));
+            }
+        }
+    }
+    if t % BLINK_TICKS != 0 || lock::showing() {
         return;
     }
     terminal::toggle_blink();
@@ -195,20 +305,105 @@ pub fn tick(t: u64) {
 }
 
 /// Relative mouse movement from the PS/2 driver. `dy` is positive upward.
-pub fn mouse(dx: i32, dy: i32, left: bool) {
+/// `buttons` has bit 0 for the left button and bit 1 for the right one.
+pub fn mouse(dx: i32, dy: i32, buttons: u8) {
     let s = state();
     let x = (s.cur_x + dx).clamp(0, fb::width() as i32 - 1);
     let y = (s.cur_y - dy).clamp(0, fb::height() as i32 - 1);
-    pointer(x, y, left);
+    pointer(x, y, buttons & 1 != 0, buttons & 2 != 0);
 }
 
-fn pointer(x: i32, y: i32, left: bool) {
+fn pointer(x: i32, y: i32, left: bool, right: bool) {
     let s = state();
+    if lock::showing() {
+        s.cur_x = x;
+        s.cur_y = y;
+        s.left = left;
+        s.right = right;
+        s.menu = None;
+        s.dock_press = None;
+        render(s, full_damage());
+        return;
+    }
     let mut damage = cursor_rect(s.cur_x, s.cur_y).union(cursor_rect(x, y));
+    {
+        // Icons and menu items that react to the pointer must repaint
+        // when it moves into or out of their area.
+        let c = theme::cfg();
+        let (old_x, old_y) = (s.cur_x, s.cur_y);
+        let dock_fx = c.dock_magnify || c.dock_hover;
+        if dock_fx && (dock_band(s).contains(old_x, old_y) || dock_band(s).contains(x, y)) {
+            damage = damage.union(dock_band(s));
+        }
+        if c.bar_hover && (old_y < TOP_H || y < TOP_H) {
+            damage = damage.union(top_rect());
+        }
+    }
     s.cur_x = x;
     s.cur_y = y;
     let pressed = left && !s.left;
+    let right_pressed = right && !s.right;
     s.left = left;
+    s.right = right;
+
+    // An open menu closes on any press. A press on one of its rows runs that
+    // row. A press anywhere else still goes on to the normal handling below.
+    if let Some(menu) = s.menu {
+        damage = damage.union(menu_rect(s, menu));
+        if pressed || right_pressed {
+            s.menu = None;
+        }
+        if pressed {
+            if let Some(action) = menu_action_at(s, menu, x, y) {
+                run_action(s, menu.app, action);
+                render(s, full_damage());
+                return;
+            }
+        }
+    }
+
+    // A dock press in progress: follow the pointer until the button is up.
+    if let Some(prev) = s.dock_press {
+        let mut dp = prev;
+        track_dock_press(&mut dp, x, y);
+        if left {
+            damage = damage.union(dock_band(s)).union(ghost_rect(prev.x, prev.y)).union(ghost_rect(x, y));
+            s.dock_press = Some(dp);
+        } else {
+            s.dock_press = None;
+            damage = damage.union(finish_dock_press(s, dp));
+        }
+        render(s, damage);
+        return;
+    }
+
+    if right_pressed {
+        if let Some(slot) = dock_slot_at(s, x, y) {
+            if let Some(app) = dock_app(s, slot) {
+                let menu = Menu { app, x, y };
+                s.menu = Some(menu);
+                damage = damage.union(menu_rect(s, menu));
+                render(s, damage);
+                return;
+            }
+        }
+    }
+
+    if pressed {
+        if let Some(slot) = dock_slot_at(s, x, y) {
+            let app = dock_app(s, slot);
+            // Pressing an app leaves the app drawer; the launcher toggles it on release.
+            if app.is_some() {
+                s.drawer = false;
+            }
+            let mut dp = DockPress { slot, app, origin_x: x, origin_y: y, x, y, moved: false };
+            track_dock_press(&mut dp, x, y);
+            s.dock_press = Some(dp);
+            damage = damage.union(dock_band(s));
+            render(s, damage);
+            return;
+        }
+    }
 
     if s.in_settings {
         if left {
@@ -258,6 +453,20 @@ fn pointer(x: i32, y: i32, left: bool) {
 /// A decoded key press goes to the focused window.
 pub fn key(c: u8) {
     let s = state();
+    if lock::showing() {
+        if lock::key(c) {
+            lock::set_busy(true);
+            render(s, full_damage());
+            let outcome = lock::submit();
+            lock::set_busy(false);
+            if outcome == lock::Outcome::Unlocked {
+                unlocked(s);
+                return;
+            }
+        }
+        render(s, full_damage());
+        return;
+    }
     if s.count == 0 {
         return;
     }
@@ -277,9 +486,20 @@ pub fn key(c: u8) {
                 return;
             }
         }
-        Kind::Welcome | Kind::Settings => return,
+        Kind::AnarchyAi => anarchyai::key(&mut s.anarchyai, c),
+        Kind::Welcome | Kind::Settings | Kind::Files => return,
     }
     render(s, s.windows[idx].rect);
+}
+
+/// The drive opened: load the saved settings and redraw the desktop.
+fn unlocked(s: &mut State) {
+    settings::load();
+    load_dock(s);
+    theme::load();
+    scene::apply();
+    terminal::print("Drive unlocked.");
+    render(s, full_damage());
 }
 
 /// Handle a mouse press. Returns the area that needs repainting.
@@ -287,17 +507,17 @@ fn click(s: &mut State, x: i32, y: i32) -> Option<Rect> {
     let full = Some(full_damage());
 
     if s.drawer {
-        if let Some(a) = drawer_app_at(x, y) {
+        if let Some(a) = drawer_app_at(s, x, y) {
             s.drawer = false;
             if let Some(w) = APPS[a].window {
                 show(s, w);
             }
             return full;
         }
-        if drawer_rect().contains(x, y) {
+        if drawer_rect(s).contains(x, y) {
             return None;
         }
-        if dock_slot_at(x, y) != Some(0) {
+        if dock_slot_at(s, x, y).is_none() {
             s.drawer = false;
             return full;
         }
@@ -317,15 +537,7 @@ fn click(s: &mut State, x: i32, y: i32) -> Option<Rect> {
         return full;
     }
 
-    if let Some(slot) = dock_slot_at(x, y) {
-        if slot == 0 {
-            s.drawer = !s.drawer;
-        } else {
-            dock_click(s, slot - 1);
-        }
-        return full;
-    }
-    if dock_rect().contains(x, y) {
+    if dock_rect(s).contains(x, y) {
         return None;
     }
 
@@ -359,9 +571,18 @@ fn click(s: &mut State, x: i32, y: i32) -> Option<Rect> {
         }
     } else if idx == SETTINGS {
         s.in_settings = true;
-        if settings_app::press(body_of(rect), &mut s.settings, x, y) == Outcome::Everything {
+        let outcome = settings_app::press(body_of(rect), &mut s.settings, x, y);
+        if s.settings.take_lock_request() {
+            lock::lock_now();
+            return Some(full_damage());
+        }
+        if outcome == Outcome::Everything {
             damage = full_damage();
         }
+    } else if idx == FILES {
+        files_app::press(body_of(rect), &mut s.files, x, y);
+    } else if idx == ANARCHYAI {
+        anarchyai::press(body_of(rect), &mut s.anarchyai, x, y);
     }
     Some(damage)
 }
@@ -394,30 +615,276 @@ fn body_of(r: Rect) -> Rect {
     Rect::new(r.x, r.y + TITLE_H, r.w, r.h - TITLE_H)
 }
 
-fn dock_rect() -> Rect {
-    let n = DOCK_SLOTS as i32;
+/// The dock's apps after the launcher: pinned ones in order, then the
+/// running apps that are not pinned, so an open app stays visible until it closes.
+fn dock_items(s: &State) -> ([usize; DOCK_MAX], usize) {
+    let mut items = [0usize; DOCK_MAX];
+    let mut n = 0;
+    for i in 0..s.pin_count {
+        items[n] = s.pins[i];
+        n += 1;
+    }
+    for app in 0..APPS.len() {
+        if n == DOCK_MAX {
+            break;
+        }
+        let running = match APPS[app].window {
+            Some(win) => s.windows[win].open,
+            None => false,
+        };
+        if running && !is_pinned(s, app) {
+            items[n] = app;
+            n += 1;
+        }
+    }
+    (items, n)
+}
+
+/// Dock slots in use, counting the launcher in slot 0.
+fn dock_slots(s: &State) -> usize {
+    1 + dock_items(s).1
+}
+
+/// The app in a dock slot, or None for the launcher.
+fn dock_app(s: &State, slot: usize) -> Option<usize> {
+    if slot == 0 {
+        return None;
+    }
+    let (items, _) = dock_items(s);
+    Some(items[slot - 1])
+}
+
+fn is_pinned(s: &State, app: usize) -> bool {
+    s.pins[..s.pin_count].contains(&app)
+}
+
+fn dock_rect(s: &State) -> Rect {
+    let n = dock_slots(s) as i32;
     let w = DOCK_PAD * 2 + n * TILE + (n - 1) * TILE_GAP;
     let screen = full_damage();
     Rect::new((screen.w - w) / 2, screen.h - DOCK_H - DOCK_BOTTOM_GAP, w, DOCK_H)
 }
 
-fn tile_rect(slot: usize) -> Rect {
-    let d = dock_rect();
+fn tile_rect(s: &State, slot: usize) -> Rect {
+    let d = dock_rect(s);
     Rect::new(d.x + DOCK_PAD + slot as i32 * (TILE + TILE_GAP), d.y + DOCK_PAD, TILE, TILE)
 }
 
-fn dock_slot_at(x: i32, y: i32) -> Option<usize> {
-    (0..DOCK_SLOTS).find(|&i| tile_rect(i).contains(x, y))
+fn dock_slot_at(s: &State, x: i32, y: i32) -> Option<usize> {
+    (0..dock_slots(s)).find(|&i| tile_rect(s, i).contains(x, y))
 }
 
-fn drawer_rect() -> Rect {
-    let d = dock_rect();
+/// The dock and the space above it that its icon effects can reach into.
+fn dock_band(s: &State) -> Rect {
+    let d = dock_rect(s);
+    Rect::new(d.x - 24, d.y - BAND_UP, d.w + 48, d.h + BAND_UP)
+}
+
+fn track_dock_press(dp: &mut DockPress, x: i32, y: i32) {
+    dp.x = x;
+    dp.y = y;
+    if (x - dp.origin_x).abs() > DRAG_START || (y - dp.origin_y).abs() > DRAG_START {
+        dp.moved = true;
+    }
+}
+
+/// The icon-sized box that follows the pointer while a dock icon is dragged.
+fn ghost_rect(x: i32, y: i32) -> Rect {
+    Rect::new(x - TILE / 2, y - TILE / 2, TILE, TILE)
+}
+
+/// A dragged pinned icon that is dropped above the dock takes the app off it.
+fn will_remove(s: &State, dp: DockPress) -> bool {
+    match dp.app {
+        Some(app) => dp.moved && is_pinned(s, app) && dp.y < dock_rect(s).y - DROP_REACH,
+        None => false,
+    }
+}
+
+/// Finish a dock press once the button is up. Returns the area to repaint.
+fn finish_dock_press(s: &mut State, dp: DockPress) -> Rect {
+    if dp.moved {
+        if will_remove(s, dp) {
+            if let Some(app) = dp.app {
+                unpin(s, app);
+            }
+        }
+        return full_damage();
+    }
+    match dp.app {
+        None => s.drawer = !s.drawer,
+        Some(app) => {
+            let win = app_window(app);
+            // Only an app that is being opened bounces, not one tucked away.
+            if theme::cfg().dock_bounce && visible(s, win).is_none() {
+                s.bounce = Some((dp.slot, s.now));
+            }
+            dock_click(s, win);
+        }
+    }
+    full_damage()
+}
+
+fn pin(s: &mut State, app: usize) {
+    if is_pinned(s, app) || s.pin_count == DOCK_MAX {
+        return;
+    }
+    s.pins[s.pin_count] = app;
+    s.pin_count += 1;
+    save_dock(s);
+}
+
+fn unpin(s: &mut State, app: usize) {
+    let found = s.pins[..s.pin_count].iter().position(|&a| a == app);
+    if let Some(p) = found {
+        for i in p..s.pin_count - 1 {
+            s.pins[i] = s.pins[i + 1];
+        }
+        s.pin_count -= 1;
+        save_dock(s);
+    }
+}
+
+/// The dock layout is kept on the drive, so it survives a reboot.
+fn save_dock(s: &State) {
+    let mut text = alloc::string::String::new();
+    for i in 0..s.pin_count {
+        if i > 0 {
+            text.push(',');
+        }
+        text.push_str(&alloc::format!("{}", s.pins[i]));
+    }
+    settings::set("dock", &text);
+    settings::flush_quietly();
+}
+
+/// Read the pinned apps from settings. Without a saved list, the defaults stay.
+fn load_dock(s: &mut State) {
+    let text = match settings::get("dock") {
+        Some(text) => text,
+        None => {
+            s.pins = DEFAULT_PINS;
+            s.pin_count = DEFAULT_PIN_COUNT;
+            return;
+        }
+    };
+    s.pin_count = 0;
+    for part in text.split(',') {
+        let app = match part.trim().parse::<usize>() {
+            Ok(app) => app,
+            Err(_) => continue,
+        };
+        let usable = app < APPS.len() && APPS[app].window.is_some();
+        if usable && !is_pinned(s, app) && s.pin_count < DOCK_MAX {
+            s.pins[s.pin_count] = app;
+            s.pin_count += 1;
+        }
+    }
+}
+
+fn menu_items(s: &State, app: usize) -> ([(Action, &'static str); 3], usize) {
+    let win = app_window(app);
+    let mut items = [(Action::Open, ""); 3];
+    let mut n = 0;
+    items[n] = if visible(s, win).is_some() {
+        (Action::Hide, "Hide")
+    } else {
+        (Action::Open, "Open")
+    };
+    n += 1;
+    items[n] = if is_pinned(s, app) {
+        (Action::Unpin, "Remove from dock")
+    } else {
+        (Action::Pin, "Keep in dock")
+    };
+    n += 1;
+    if s.windows[win].open {
+        items[n] = (Action::Close, "Close window");
+        n += 1;
+    }
+    (items, n)
+}
+
+fn menu_rect(s: &State, m: Menu) -> Rect {
+    let (_, n) = menu_items(s, m.app);
+    let h = 2 * MENU_PAD + n as i32 * MENU_ROW;
+    let screen = full_damage();
+    let x = (m.x - MENU_W / 2).clamp(8, (screen.w - MENU_W - 8).max(8));
+    let y = (m.y - h - 12).max(TOP_H + 8);
+    Rect::new(x, y, MENU_W, h)
+}
+
+/// The menu row under a point, if any.
+fn menu_row_at(s: &State, m: Menu, x: i32, y: i32) -> Option<usize> {
+    let r = menu_rect(s, m);
+    if !r.contains(x, y) {
+        return None;
+    }
+    let dy = y - r.y - MENU_PAD;
+    if dy < 0 {
+        return None;
+    }
+    let row = dy as usize / MENU_ROW as usize;
+    let (_, n) = menu_items(s, m.app);
+    if row < n {
+        Some(row)
+    } else {
+        None
+    }
+}
+
+fn menu_action_at(s: &State, m: Menu, x: i32, y: i32) -> Option<Action> {
+    let row = menu_row_at(s, m, x, y)?;
+    let (items, _) = menu_items(s, m.app);
+    Some(items[row].0)
+}
+
+fn run_action(s: &mut State, app: usize, action: Action) {
+    let win = app_window(app);
+    match action {
+        Action::Open => show(s, win),
+        Action::Hide => hide(s, win),
+        Action::Pin => pin(s, app),
+        Action::Unpin => unpin(s, app),
+        Action::Close => close(s, win),
+    }
+}
+
+/// Size and lift of a dock icon right now. Magnification grows an icon
+/// near the pointer, hover lifts the icon under it, and a launch bounce
+/// lifts the icon that was opened.
+fn tile_look(s: &State, slot: usize) -> (i32, i32) {
+    let c = theme::cfg();
+    let t = tile_rect(s, slot);
+    let (px, py) = (s.cur_x, s.cur_y);
+    let mut size = TILE;
+    let mut lift = 0;
+    if c.dock_magnify && dock_band(s).contains(px, py) {
+        let dx = (px - (t.x + TILE / 2)).abs();
+        if dx < MAG_RANGE {
+            size += MAG_GROW * (MAG_RANGE - dx) / MAG_RANGE;
+        }
+    }
+    if c.dock_hover && t.contains(px, py) {
+        lift += HOVER_LIFT;
+    }
+    if let Some((bounce_slot, start)) = s.bounce {
+        if bounce_slot == slot {
+            let step = (s.now.wrapping_sub(start) / BOUNCE_STEP) as usize;
+            lift += BOUNCE[step.min(BOUNCE.len() - 1)];
+        }
+    }
+    (size, lift)
+}
+
+fn drawer_rect(s: &State) -> Rect {
+    let d = dock_rect(s);
     let screen = full_damage();
     Rect::new((screen.w - DRAWER_W) / 2, d.y - 14 - DRAWER_H, DRAWER_W, DRAWER_H)
 }
 
-fn drawer_cell(i: usize) -> Rect {
-    let r = drawer_rect();
+fn drawer_cell(s: &State, i: usize) -> Rect {
+    let r = drawer_rect(s);
     let cols = DRAWER_COLS as i32;
     let gx = (DRAWER_W - cols * CELL_W) / 2;
     Rect::new(
@@ -428,8 +895,8 @@ fn drawer_cell(i: usize) -> Rect {
     )
 }
 
-fn drawer_app_at(x: i32, y: i32) -> Option<usize> {
-    (0..APPS.len()).find(|&i| drawer_cell(i).contains(x, y) && APPS[i].window.is_some())
+fn drawer_app_at(s: &State, x: i32, y: i32) -> Option<usize> {
+    (0..APPS.len()).find(|&i| drawer_cell(s, i).contains(x, y) && APPS[i].window.is_some())
 }
 
 fn dot_center(rect: Rect, n: i32) -> (i32, i32) {
@@ -532,16 +999,22 @@ fn render(s: &mut State, r: Rect) {
     let r = Rect::new(x0, y0, x1 - x0, y1 - y0);
     fb::set_clip(r.x as u32, r.y as u32, r.w as u32, r.h as u32);
 
-    scene::draw_background();
-    for pos in 0..s.count {
-        let idx = s.order[pos];
-        if s.windows[idx].rect.grow(SHADOW).overlaps(r) {
-            draw_window(s, idx, pos + 1 == s.count);
+    if lock::showing() {
+        lock::draw(screen);
+    } else {
+        scene::draw_background();
+        for pos in 0..s.count {
+            let idx = s.order[pos];
+            if s.windows[idx].rect.grow(SHADOW).overlaps(r) {
+                draw_window(s, idx, pos + 1 == s.count);
+            }
         }
+        draw_dock(s);
+        draw_drawer(s);
+        draw_ghost(s);
+        draw_menu(s);
+        draw_topbar(s);
     }
-    draw_dock(s);
-    draw_drawer(s);
-    draw_topbar(s);
     draw_cursor(s.cur_x, s.cur_y);
 
     fb::reset_clip();
@@ -550,30 +1023,52 @@ fn render(s: &mut State, r: Rect) {
 
 /// A rounded app icon: a shaded tile with a white symbol on it.
 fn draw_tile(x: i32, y: i32, size: i32, app: &App, alpha: u32) {
+    if let Some(art) = image::app_art(app.art) {
+        let img = if size > TILE { &art.s64 } else { &art.s48 };
+        gfx::art_scaled(x, y, img, size, size * 27 / 100, alpha);
+        return;
+    }
     gfx::round_grad(x, y, size, size, size * 27 / 100, app.top, app.bottom, alpha);
     gfx::stroke(x, y, size, size, size * 27 / 100, WHITE, 38 * alpha / 255);
-    let mask = if size >= BIG_TILE { image::icon34(app.icon) } else { image::icon26(app.icon) };
+    let mask = if size >= 56 { image::icon34(app.icon) } else { image::icon26(app.icon) };
     let off = (size - mask.size as i32) / 2;
     gfx::icon_a(x + off, y + off, mask, WHITE, alpha);
 }
 
 fn draw_dock(s: &State) {
-    let d = dock_rect();
+    let d = dock_rect(s);
     let c = theme::cfg();
     gfx::round_a(d.x, d.y, d.w, d.h, 20, theme::BAR, theme::alpha(c.dock_opacity));
     gfx::stroke(d.x, d.y, d.w, d.h, 20, WHITE, theme::EDGE_A);
 
-    for slot in 0..DOCK_SLOTS {
-        let t = tile_rect(slot);
+    let (items, _) = dock_items(s);
+    for slot in 0..dock_slots(s) {
+        let t = tile_rect(s, slot);
+        let (size, lift) = tile_look(s, slot);
+        // Icons grow upward from the dock's baseline, centred on the slot.
+        let x = t.x + TILE / 2 - size / 2;
+        let y = t.y + TILE - size - lift;
         if slot == 0 {
-            gfx::image_a(t.x, t.y, &MARK_48, 255);
+            if size == TILE && lift == 0 {
+                gfx::image_a(t.x, t.y, &MARK_48, 255);
+            } else {
+                gfx::art_scaled(x, y, &MARK_48, size, 0, 255);
+            }
             if s.drawer {
                 gfx::round(t.x + TILE / 2 - 8, d.y + d.h - 6, 16, 3, 1, theme::accent());
             }
         } else {
-            draw_tile(t.x, t.y, TILE, &APPS[slot - 1], 255);
-            if s.windows[slot - 1].open {
-                let on_screen = visible(s, slot - 1).is_some();
+            let app = items[slot - 1];
+            // The icon being dragged out is shown under the pointer instead.
+            if let Some(dp) = s.dock_press {
+                if dp.app == Some(app) && will_remove(s, dp) {
+                    continue;
+                }
+            }
+            let win = app_window(app);
+            draw_tile(x, y, size, &APPS[app], 255);
+            if s.windows[win].open {
+                let on_screen = visible(s, win).is_some();
                 let color = if on_screen { WHITE } else { FAINT };
                 gfx::round(t.x + TILE / 2 - 2, d.y + d.h - 7, 4, 4, 2, color);
             }
@@ -581,11 +1076,46 @@ fn draw_dock(s: &State) {
     }
 }
 
+/// The icon that follows the pointer while a dock icon is being dragged.
+fn draw_ghost(s: &State) {
+    let Some(dp) = s.dock_press else { return };
+    let Some(app) = dp.app else { return };
+    if !dp.moved {
+        return;
+    }
+    let alpha = if will_remove(s, dp) { 255 } else { 170 };
+    let g = ghost_rect(dp.x, dp.y);
+    draw_tile(g.x, g.y, TILE, &APPS[app], alpha);
+}
+
+/// The right-click menu for a dock icon.
+fn draw_menu(s: &State) {
+    let Some(m) = s.menu else { return };
+    let r = menu_rect(s, m);
+    let (items, n) = menu_items(s, m.app);
+    let hover = menu_row_at(s, m, s.cur_x, s.cur_y);
+    let alpha = theme::alpha(theme::cfg().dock_opacity).max(215);
+    gfx::shadow(r.x, r.y, r.w, r.h, 16, 40);
+    gfx::round_a(r.x, r.y, r.w, r.h, 16, theme::BAR, alpha);
+    gfx::stroke(r.x, r.y, r.w, r.h, 16, WHITE, theme::EDGE_A);
+    for i in 0..n {
+        let row = Rect::new(r.x + 6, r.y + MENU_PAD + i as i32 * MENU_ROW, r.w - 12, MENU_ROW);
+        let hot = hover == Some(i);
+        let color = if hot {
+            gfx::round_a(row.x, row.y, row.w, row.h, 8, theme::accent(), 220);
+            WHITE
+        } else {
+            TEXT
+        };
+        gfx::text(row.x + 12, row.y + 6, &LABEL, items[i].1, color);
+    }
+}
+
 fn draw_drawer(s: &State) {
     if !s.drawer {
         return;
     }
-    let r = drawer_rect();
+    let r = drawer_rect(s);
     let alpha = theme::alpha(theme::cfg().dock_opacity).max(215);
     gfx::shadow(r.x, r.y, r.w, r.h, 22, 40);
     gfx::round_a(r.x, r.y, r.w, r.h, 22, theme::BAR, alpha);
@@ -593,7 +1123,7 @@ fn draw_drawer(s: &State) {
     gfx::text(r.x + 30, r.y + 22, &TITLE, "Applications", TEXT);
 
     for (i, app) in APPS.iter().enumerate() {
-        let cell = drawer_cell(i);
+        let cell = drawer_cell(s, i);
         let ready = app.window.is_some();
         let tx = cell.x + (CELL_W - BIG_TILE) / 2;
         draw_tile(tx, cell.y + 6, BIG_TILE, app, if ready { 255 } else { 70 });
@@ -638,6 +1168,19 @@ fn draw_topbar(s: &State) {
     gfx::rect_a(0, TOP_H - 1, w, 1, WHITE, 16);
 
     let bar = bar_layout();
+    if c.bar_hover && s.cur_y < TOP_H {
+        // A soft pill behind the part of the menu bar under the pointer.
+        let zones = [
+            Rect::new(4, 4, bar.name_x - 14, TOP_H - 8),
+            Rect::new(bar.status_x - 8, 4, 58, TOP_H - 8),
+            Rect::new(bar.clock_x - 8, 4, w - bar.clock_x - 4, TOP_H - 8),
+        ];
+        for z in zones {
+            if z.contains(s.cur_x, s.cur_y) {
+                gfx::round_a(z.x, z.y, z.w, z.h, 8, WHITE, 26);
+            }
+        }
+    }
     gfx::image_a(14, (TOP_H - MARK_22.h as i32) / 2, &MARK_22, 255);
 
     let name = if s.count > 0 { s.windows[s.order[s.count - 1]].title } else { "Desktop" };
@@ -660,10 +1203,23 @@ fn draw_window(s: &mut State, idx: usize, focused: bool) {
     let alpha = theme::alpha(c.window_opacity);
 
     if c.shadows && !win.full {
-        gfx::shadow(x, y, w, h, radius, if focused { 46 } else { 26 });
+        let base = if focused { 46 } else { 26 };
+        gfx::shadow(x, y, w, h, radius, base * c.shadow_strength / 100);
     }
-    gfx::round_frost(x, y, w, h, radius, theme::WINDOW, alpha, scene::frost(), fb::width() as i32);
+    if c.focus_glow && focused && !win.full {
+        // An accent glow that fades out away from the window.
+        for k in 1..=5i32 {
+            gfx::stroke(x - k, y - k, w + 2 * k, h + 2 * k, radius + k, theme::accent(), (90 / k) as u32);
+        }
+    }
+    let tint = gfx::mix(theme::WINDOW, theme::accent(), c.tint * 255 / 100);
+    gfx::round_frost(x, y, w, h, radius, tint, alpha, scene::frost(), fb::width() as i32);
     gfx::stroke(x, y, w, h, radius, WHITE, if focused { theme::EDGE_A } else { theme::LINE_A });
+    if c.border_width > 0 && (focused || !c.border_focus_only) && !win.full {
+        for i in 0..c.border_width as i32 {
+            gfx::stroke(x + i, y + i, w - 2 * i, h - 2 * i, (radius - i).max(0), theme::border_colour(), 255);
+        }
+    }
 
     // Clip the contents to the frame so nothing spills onto other windows.
     let prev = fb::current_clip();
@@ -692,6 +1248,8 @@ fn draw_window(s: &mut State, idx: usize, focused: bool) {
         Kind::Keys => keys_content(body),
         Kind::Terminal => terminal::draw(body.x, body.y, body.w, body.h),
         Kind::Settings => settings_app::draw(body, &mut s.settings),
+        Kind::Files => files_app::draw(body, &mut s.files),
+        Kind::AnarchyAi => anarchyai::draw(body, &mut s.anarchyai),
     }
 
     if !win.full {

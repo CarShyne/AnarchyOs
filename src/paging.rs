@@ -207,6 +207,78 @@ pub fn self_test(root: u64) {
     );
 }
 
+/// The PML4 that is active right now.
+pub fn current_root() -> u64 {
+    read_cr3()
+}
+
+/// Make `root` the active address space.
+pub fn activate(root: u64) {
+    write_cr3(root);
+}
+
+/// A new, empty lower half for a user program. The higher half is shared
+/// with the kernel, so the kernel stays reachable when the program is running.
+pub fn new_address_space(kernel_root: u64) -> Option<u64> {
+    let root = new_table()?;
+    for i in 256..ENTRIES {
+        table(root)[i] = table(kernel_root)[i];
+    }
+    Some(root)
+}
+
+/// Map a user page. Unlike `map_4k`, every table on the way down gets the
+/// USER bit, because the CPU checks the bit at each level.
+pub fn map_user_4k(root: u64, virt: u64, phys: u64, flags: u64) -> Option<()> {
+    let mut current = root;
+    for level in [4u32, 3, 2] {
+        let idx = index(virt, level);
+        let entry = table(current)[idx];
+        current = if entry & PRESENT == 0 {
+            let next = new_table()?;
+            table(current)[idx] = next | PRESENT | WRITABLE | USER;
+            next
+        } else if entry & HUGE != 0 {
+            return None; // user mappings never sit under a huge page
+        } else {
+            table(current)[idx] = entry | USER;
+            entry & ADDR_MASK
+        };
+    }
+    table(current)[index(virt, 1)] = (phys & ADDR_MASK) | flags | PRESENT | USER;
+    flush(virt);
+    Some(())
+}
+
+/// Free every frame in the lower half of `root`: data pages, the tables that
+/// map them, and the PML4 itself. The higher half is shared, so it is left alone.
+pub fn free_user_space(root: u64) {
+    for i in 0..256 {
+        let entry = table(root)[i];
+        if entry & PRESENT != 0 {
+            free_level(entry & ADDR_MASK, 3);
+        }
+    }
+    pmm::free_frame(root);
+}
+
+fn free_level(phys: u64, level: u32) {
+    if level > 1 {
+        for entry in table(phys).iter() {
+            if entry & PRESENT != 0 && entry & HUGE == 0 {
+                free_level(entry & ADDR_MASK, level - 1);
+            }
+        }
+    } else {
+        for entry in table(phys).iter() {
+            if entry & PRESENT != 0 {
+                pmm::free_frame(entry & ADDR_MASK);
+            }
+        }
+    }
+    pmm::free_frame(phys);
+}
+
 /// Decode the page-fault error code into plain words.
 pub fn describe_page_fault(error_code: u64) {
     let cause = if error_code & 1 != 0 { "protection violation" } else { "page not present" };

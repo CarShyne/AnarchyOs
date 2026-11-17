@@ -30,6 +30,9 @@ pub const WALLPAPER: usize = 6;
 pub const DOCK: usize = 7;
 pub const DISPLAY: usize = 8;
 pub const STORAGE: usize = 9;
+pub const WINDOW_STYLE: usize = 10;
+pub const BARS_GLASS: usize = 11;
+pub const RICE_MODS: usize = 12;
 
 struct Page {
     name: &'static str,
@@ -37,7 +40,7 @@ struct Page {
     color: u32,
 }
 
-const PAGES: [Page; 10] = [
+const PAGES: [Page; 13] = [
     Page { name: "About", icon: icon::INFO, color: 0x0064_6C7A },
     Page { name: "Date & Time", icon: icon::CLOCK, color: 0x00E5_484D },
     Page { name: "Network", icon: icon::ETHERNET, color: 0x003B_82F6 },
@@ -48,14 +51,18 @@ const PAGES: [Page; 10] = [
     Page { name: "Dock & Menu Bar", icon: icon::DOCK, color: 0x00F5_9E0B },
     Page { name: "Display", icon: icon::MONITOR, color: 0x0063_66F1 },
     Page { name: "Storage", icon: icon::DRIVE, color: 0x0064_748B },
+    Page { name: "Window Styling", icon: icon::PALETTE, color: 0x00EC_4899 },
+    Page { name: "Bars & Glass", icon: icon::DOCK, color: 0x0008_91B2 },
+    Page { name: "Rice Mods", icon: icon::SPARKLES, color: 0x0022_C55E },
 ];
 
 /// Sidebar groups: a caption and the pages listed under it.
-const GROUPS: [(&str, &[usize]); 4] = [
+const GROUPS: [(&str, &[usize]); 5] = [
     ("GENERAL", &[ABOUT, DATE_TIME]),
     ("CONNECTIVITY", &[NETWORK, WIFI, BLUETOOTH]),
     ("PERSONALISATION", &[THEME, WALLPAPER, DOCK]),
     ("SYSTEM", &[DISPLAY, STORAGE]),
+    ("RICE", &[WINDOW_STYLE, BARS_GLASS, RICE_MODS]),
 ];
 
 const SIDEBAR_W: i32 = 224;
@@ -70,12 +77,14 @@ pub struct State {
     dirty: bool,
     /// File list for the Storage page, read when the page is opened so
     /// that redrawing the window never touches the disk.
-    files: Vec<(String, u32)>,
+    files: Vec<fs::Entry>,
+    /// The Storage page's Lock button was pressed. The window manager acts on it.
+    lock_requested: bool,
 }
 
 impl State {
     pub const fn new() -> State {
-        State { page: ABOUT, active: None, dirty: false, files: Vec::new() }
+        State { page: ABOUT, active: None, dirty: false, files: Vec::new(), lock_requested: false }
     }
 
     pub fn page(&self) -> usize {
@@ -85,12 +94,12 @@ impl State {
     pub fn set_page(&mut self, page: usize) {
         self.page = page;
         if page == STORAGE {
-            self.files.clear();
-            if virtio_blk::ready() {
-                let files = &mut self.files;
-                fs::list(|name, size| files.push((String::from(name), size)));
-            }
+            self.files = fs::list("/").unwrap_or_default();
         }
+    }
+
+    pub fn take_lock_request(&mut self) -> bool {
+        core::mem::take(&mut self.lock_requested)
     }
 }
 
@@ -183,7 +192,7 @@ fn sidebar(body: Rect, st: &State, phase: Phase, mx: i32, my: i32) -> Option<usi
         if drawing {
             gfx::text(body.x + 20, y + 4, &SMALL, caption, FAINT);
         }
-        y += 26;
+        y += 24;
         for &p in pages.iter() {
             let item = Rect::new(body.x + 10, y, SIDEBAR_W - 20, ITEM_H - 2);
             if drawing {
@@ -202,12 +211,12 @@ fn sidebar(body: Rect, st: &State, phase: Phase, mx: i32, my: i32) -> Option<usi
             }
             y += ITEM_H;
         }
-        y += 8;
+        y += 6;
     }
     None
 }
 
-fn page(ui: &mut Ui, st: &State) {
+fn page(ui: &mut Ui, st: &mut State) {
     match st.page {
         ABOUT => about(ui),
         DATE_TIME => date_time(ui),
@@ -217,8 +226,11 @@ fn page(ui: &mut Ui, st: &State) {
         THEME => theme_page(ui),
         WALLPAPER => wallpaper(ui),
         DOCK => dock(ui),
+        WINDOW_STYLE => window_style(ui),
+        BARS_GLASS => bars_glass(ui),
+        RICE_MODS => rice_mods(ui),
         DISPLAY => display(ui),
-        _ => storage(ui, &st.files),
+        _ => storage(ui, st),
     }
 }
 
@@ -400,12 +412,77 @@ fn wallpaper(ui: &mut Ui) {
 }
 
 fn dock(ui: &mut Ui) {
-    ui.heading("Dock & Menu Bar", "How solid the bars at the top and bottom of the screen are.");
+    ui.heading("Dock & Menu Bar", "Effects for the dock and the menu bar. Transparency is under Rice.");
     let c = theme::cfg();
+    ui.section("Dock");
+    ui.card(3);
+    ui.toggle("Bounce when an app opens", &mut c.dock_bounce);
+    ui.toggle("Lift the icon under the pointer", &mut c.dock_hover);
+    ui.toggle("Magnify icons near the pointer", &mut c.dock_magnify);
+
+    ui.section("Menu bar");
+    ui.card(1);
+    ui.toggle("Highlight the part under the pointer", &mut c.bar_hover);
+    ui.note("Clock options are under Date & Time.");
+}
+
+// ---- Rice ----------------------------------------------------------------
+
+fn window_style(ui: &mut Ui) {
+    ui.heading("Window Styling", "Borders, corners, shadows and frosted glass for windows.");
+    let c = theme::cfg();
+    let blur_before = c.blur;
+
+    ui.section("Border");
+    ui.card(3);
+    ui.slider("Border width", &mut c.border_width, 0, theme::MAX_BORDER, " px");
+    let colors: [u32; 6] = core::array::from_fn(|i| ACCENTS[i].1);
+    ui.swatches("Border colour", &colors, &mut c.border_color);
+    ui.toggle("Only on the focused window", &mut c.border_focus_only);
+
+    ui.section("Shape and shadow");
+    ui.card(3);
+    ui.slider("Corner radius", &mut c.radius, 0, theme::MAX_RADIUS, " px");
+    ui.toggle("Shadows", &mut c.shadows);
+    ui.slider("Shadow strength", &mut c.shadow_strength, 0, 100, "%");
+
+    ui.section("Glass");
+    ui.card(3);
+    ui.slider("Blur", &mut c.blur, 0, 100, "%");
+    ui.slider("Tint with the accent colour", &mut c.tint, 0, theme::MAX_TINT, "%");
+    ui.toggle("Glow around the focused window", &mut c.focus_glow);
+
+    // The frosted copy of the wallpaper depends on the blur, so rebuild it.
+    if c.blur != blur_before {
+        scene::apply();
+    }
+}
+
+fn bars_glass(ui: &mut Ui) {
+    ui.heading("Bars & Glass", "How solid the menu bar and the dock are. Lower values let the wallpaper through.");
+    let c = theme::cfg();
+    ui.section("Bars");
     ui.card(2);
     ui.slider("Menu bar opacity", &mut c.top_opacity, 0, 100, "%");
     ui.slider("Dock opacity", &mut c.dock_opacity, 0, 100, "%");
-    ui.note("Clock options are under Date & Time.");
+    ui.note("Window transparency is under Theme.");
+}
+
+fn rice_mods(ui: &mut Ui) {
+    ui.heading("Rice Mods", "Extra looks for the desktop. They are baked into the wallpaper, so they cost nothing per frame.");
+    let c = theme::cfg();
+    let before = (c.scanlines, c.vignette, c.grain, c.desk_tint);
+
+    ui.section("Wallpaper");
+    ui.card(4);
+    ui.toggle("Scanlines", &mut c.scanlines);
+    ui.toggle("Vignette", &mut c.vignette);
+    ui.toggle("Film grain", &mut c.grain);
+    ui.slider("Accent wash", &mut c.desk_tint, 0, theme::MAX_DESK_TINT, "%");
+
+    if before != (c.scanlines, c.vignette, c.grain, c.desk_tint) {
+        scene::apply();
+    }
 }
 
 // ---- System --------------------------------------------------------------
@@ -420,32 +497,43 @@ fn display(ui: &mut Ui) {
     ui.note("The bootloader picks the resolution. Change it with the resolution line in limine.conf.");
 }
 
-fn storage(ui: &mut Ui, files: &[(String, u32)]) {
-    ui.heading("Storage", "The virtio disk and the files on it.");
+fn storage(ui: &mut Ui, st: &mut State) {
+    ui.heading("Storage", "Your encrypted drive and the folders on it.");
     if !virtio_blk::ready() {
         ui.card(1);
-        ui.status("Disk", "Not attached", FAINT);
-        ui.note("Settings cannot be saved without a disk, so they reset at reboot.");
+        ui.status("Drive", "Not attached", FAINT);
+        ui.note("Settings cannot be saved without a drive, so they reset at reboot.");
+        return;
+    }
+    if !fs::mounted() {
+        ui.card(1);
+        ui.status("Drive", "Locked", MUTED);
+        ui.note("Unlock the drive to see its folders and files. Lock it again with the Terminal's lock command.");
         return;
     }
 
-    let total = virtio_blk::sectors() * 512;
-    // One superblock sector, eight directory sectors, then whole sectors per file.
-    let used = 9 * 512 + files.iter().map(|f| (f.1 as u64 + 511) / 512 * 512).sum::<u64>();
+    let total = fs::total_bytes();
+    let used = fs::used_bytes();
+    ui.card(3);
+    ui.meter("Encrypted drive", &format!("{} KiB of {} KiB used", used / 1024, total / 1024), used, total);
+    ui.info("Cipher", "ChaCha20, keys from PBKDF2-SHA256");
+    ui.status("Status", "Unlocked", GOOD);
 
-    ui.card(2);
-    ui.meter("AnarchyFS", &format!("{} KiB of {} KiB used", used / 1024, total / 1024), used, total);
-    ui.info("Files", &format!("{}", files.len()));
+    ui.card(1);
+    if ui.button("Lock the drive", "Lock now") {
+        st.lock_requested = true;
+    }
 
-    if !files.is_empty() {
-        ui.section("Files");
-        let shown = files.len().min(6);
+    ui.section("Top-level folders and files");
+    let shown = st.files.len().min(8);
+    if shown > 0 {
         ui.card(shown as u32);
-        for (name, size) in files.iter().take(shown) {
-            ui.info(name, &format!("{} B", size));
+        for e in st.files.iter().take(shown) {
+            let detail = if e.dir { String::from("folder") } else { format!("{} B", e.size) };
+            ui.info(&e.name, &detail);
         }
-        if files.len() > shown {
-            ui.note(&format!("and {} more. Use ls in the Terminal to see them all.", files.len() - shown));
-        }
+    }
+    if st.files.len() > shown {
+        ui.note(&format!("and {} more. Open the Files app to see them all.", st.files.len() - shown));
     }
 }

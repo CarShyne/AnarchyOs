@@ -3,17 +3,12 @@ ISO_DIR := build/iso_root
 ISO     := build/anarchyos.iso
 LIMINE  := third_party/limine
 DISK    := build/disk.img
-WALL    := $(shell find . -type f -path "*/wallpaper/*" ! -name ".*" ! -path "./target/*" ! -path "./build/*" | head -n 1)
-LOGO    := $(shell find . -type f -name "AnarchyOs-logo.png" ! -path "./target/*" ! -path "./build/*" | head -n 1)
 
-.PHONY: all assets kernel iso disk run clean reset-disk
+MUSL_CC ?= x86_64-linux-musl-gcc
+
+.PHONY: all kernel iso disk run clean reset-disk userland disk-programs
 
 all: iso
-
-assets:
-	@mkdir -p assets
-	sips -s format bmp -z 800 1280 "$(WALL)" --out assets/wallpaper.bmp >/dev/null
-	sips -s format bmp -Z 30 "$(LOGO)" --out assets/logo.bmp >/dev/null
 
 kernel:
 	cargo build
@@ -50,3 +45,18 @@ clean:
 
 reset-disk:
 	rm -f $(DISK)
+
+# Static programs for the drive. Needs a musl cross compiler on the build
+# machine, for example: brew install filosottile/musl-cross/musl-cross
+userland:
+	@mkdir -p userland/build
+	$(MUSL_CC) -static -O2 -Wall -o userland/build/hello userland/hello/hello.c
+
+# A new drive with the programs already inside, encrypted with ANARCHY_PASS.
+# It never overwrites a drive that already holds data: run reset-disk first.
+disk-programs: userland disk
+	@[ -n "$$ANARCHY_PASS" ] || { echo "set ANARCHY_PASS to the drive passphrase (at least 8 characters)"; exit 1; }
+	RUSTFLAGS= cargo run --quiet --release --manifest-path tools/mkdisk/Cargo.toml \
+		--target x86_64-unknown-linux-gnu -- $(DISK) \
+		/Applications/hello userland/build/hello \
+		/Documents/hello.txt userland/hello/hello.txt

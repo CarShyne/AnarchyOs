@@ -194,27 +194,37 @@ fn wallpapers(g: &mut Gen, root: &Path) {
     writeln!(g.code, "];").unwrap();
 }
 
+fn load_named(root: &Path, file: &str) -> Option<RgbaImage> {
+    find_file(root, file).and_then(|p| {
+        println!("cargo:rerun-if-changed={}", p.display());
+        load(&p)
+    })
+}
+
+/// The menu bar mark, the launcher icon, and the wordmark.
 fn logos(g: &mut Gen, root: &Path) {
     let blank = RgbaImage::new(1, 1);
 
-    let mark = find_file(root, "App-Drawer.png").and_then(|p| {
-        println!("cargo:rerun-if-changed={}", p.display());
-        load(&p)
-    });
+    let mark = load_named(root, "AnarchyAI-Logo.png");
+    let launcher = load_named(root, "App-Drawer.png");
     if mark.is_none() {
-        warn("assets/App-Drawer.png not found, using a blank icon");
+        warn("assets/AnarchyAI-Logo.png not found, the menu bar has no logo");
     }
-    let mark = mark.map(|m| trim(&m)).unwrap_or_else(|| blank.clone());
-    for (name, size) in [("MARK_22", 22u32), ("MARK_48", 48), ("MARK_64", 64)] {
-        let im = if mark.width() > 1 { fit_height(&mark, size) } else { blank.clone() };
+    if launcher.is_none() {
+        warn("assets/App-Drawer.png not found, the launcher has no icon");
+    }
+    let mark = mark.map(|m| trim(&m));
+    let launcher = launcher.map(|m| trim(&m));
+    for (name, src, size) in [("MARK_22", &mark, 22u32), ("MARK_48", &launcher, 48), ("MARK_64", &launcher, 64)] {
+        let im = match src {
+            Some(m) if m.width() > 1 => fit_height(m, size),
+            _ => blank.clone(),
+        };
         let e = g.img(&im);
         writeln!(g.code, "pub static {}: Img = {};", name, e).unwrap();
     }
 
-    let word = find_file(root, "AnarchyOs-logo.png").and_then(|p| {
-        println!("cargo:rerun-if-changed={}", p.display());
-        load(&p)
-    });
+    let word = load_named(root, "AnarchyOs-logo.png");
     if word.is_none() {
         warn("assets/AnarchyOs-logo.png not found, using a blank logo");
     }
@@ -222,6 +232,52 @@ fn logos(g: &mut Gen, root: &Path) {
     let im = if word.width() > 1 { fit_height(&word, 96) } else { blank };
     let e = g.img(&im);
     writeln!(g.code, "pub static WORDMARK: Img = {};", e).unwrap();
+}
+
+/// Scale an image to fit inside a square, centred, with transparent margins.
+fn fit_square(im: &RgbaImage, size: u32) -> RgbaImage {
+    let (w, h) = im.dimensions();
+    let scale = size as f64 / w.max(h).max(1) as f64;
+    let nw = ((w as f64 * scale).round() as u32).clamp(1, size);
+    let nh = ((h as f64 * scale).round() as u32).clamp(1, size);
+    let scaled = image::imageops::resize(im, nw, nh, FilterType::Lanczos3);
+    let mut out = RgbaImage::new(size, size);
+    image::imageops::overlay(&mut out, &scaled, ((size - nw) / 2) as i64, ((size - nh) / 2) as i64);
+    out
+}
+
+/// Every image dropped into assets/icons/<dir> becomes a full-colour icon
+/// in the table `table`, named after its file name without the extension.
+/// Each one is stored at 48 and 64 pixels, the two sizes the desktop uses.
+fn art(g: &mut Gen, root: &Path, dir: &str, table: &str) {
+    let folder = root.join("icons").join(dir);
+    println!("cargo:rerun-if-changed={}", folder.display());
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(&folder) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+            if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "ico") {
+                println!("cargo:rerun-if-changed={}", p.display());
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+
+    let mut items = Vec::new();
+    for p in &files {
+        if let Some(im) = load(p) {
+            let s48 = g.img(&fit_square(&im, 48));
+            let s64 = g.img(&fit_square(&im, 64));
+            items.push(format!("Art {{ name: \"{}\", s48: {}, s64: {} }}", pretty_name(p), s48, s64));
+        }
+    }
+    writeln!(g.code, "pub static {}: &[Art] = &[", table).unwrap();
+    for it in &items {
+        writeln!(g.code, "    {},", it).unwrap();
+    }
+    writeln!(g.code, "];").unwrap();
 }
 
 fn read_font(root: &Path, file: &str) -> fontdue::Font {
@@ -321,6 +377,8 @@ fn main() {
     writeln!(g.code, "pub const WALLPAPER_H: u32 = {};", SCREEN_H).unwrap();
     wallpapers(&mut g, &root);
     logos(&mut g, &root);
+    art(&mut g, &root, "apps", "APP_ART");
+    art(&mut g, &root, "folders", "FOLDER_ART");
     fonts(&mut g, &root);
     icons(&mut g, &root);
 

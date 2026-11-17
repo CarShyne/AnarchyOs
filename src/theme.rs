@@ -31,6 +31,11 @@ pub const ACCENTS: [(&str, u32); 6] = [
 
 pub const MIN_WINDOW_OPACITY: u32 = 30;
 pub const MAX_RADIUS: u32 = 20;
+pub const MAX_BORDER: u32 = 4;
+/// Largest blur radius in pixels, reached at 100 percent.
+pub const MAX_BLUR_RADIUS: u32 = 36;
+pub const MAX_TINT: u32 = 40;
+pub const MAX_DESK_TINT: u32 = 40;
 
 pub struct Config {
     pub top_opacity: u32,
@@ -45,6 +50,35 @@ pub struct Config {
     pub show_seconds: bool,
     pub show_date: bool,
     pub tz_offset: i32,
+
+    // Rice: window styling.
+    /// Border thickness in pixels. Zero means no border.
+    pub border_width: u32,
+    /// Index into ACCENTS for the border colour.
+    pub border_color: usize,
+    /// Draw the border only on the focused window.
+    pub border_focus_only: bool,
+    /// Shadow darkness as a percentage of the normal shadow.
+    pub shadow_strength: u32,
+    /// Frosted-glass blur, 0..=100 percent of MAX_BLUR_RADIUS.
+    pub blur: u32,
+    /// Accent colour mixed into the window glass, in percent.
+    pub tint: u32,
+    /// A soft accent glow around the focused window.
+    pub focus_glow: bool,
+
+    // Rice: dock and menu bar effects.
+    pub dock_magnify: bool,
+    pub dock_hover: bool,
+    pub dock_bounce: bool,
+    pub bar_hover: bool,
+
+    // Rice: wallpaper mods, baked into the desktop picture.
+    pub scanlines: bool,
+    pub vignette: bool,
+    pub grain: bool,
+    /// Accent colour washed over the wallpaper, in percent.
+    pub desk_tint: u32,
 }
 
 static mut CONFIG: Config = Config {
@@ -59,6 +93,21 @@ static mut CONFIG: Config = Config {
     show_seconds: false,
     show_date: true,
     tz_offset: 0,
+    border_width: 0,
+    border_color: 0,
+    border_focus_only: true,
+    shadow_strength: 100,
+    blur: 39,
+    tint: 0,
+    focus_glow: false,
+    dock_magnify: false,
+    dock_hover: true,
+    dock_bounce: true,
+    bar_hover: true,
+    scanlines: false,
+    vignette: false,
+    grain: false,
+    desk_tint: 0,
 };
 
 // Only the main loop reads or writes the config.
@@ -70,9 +119,25 @@ pub fn accent() -> u32 {
     ACCENTS[cfg().accent.min(ACCENTS.len() - 1)].1
 }
 
+/// The accent colour chosen for window borders.
+pub fn border_colour() -> u32 {
+    ACCENTS[cfg().border_color.min(ACCENTS.len() - 1)].1
+}
+
+/// Blur radius in pixels for the current blur setting.
+pub fn blur_radius() -> usize {
+    (cfg().blur.min(100) * MAX_BLUR_RADIUS / 100) as usize
+}
+
 /// 0..=100 percent to 0..=255 alpha.
 pub fn alpha(percent: u32) -> u32 {
     percent.min(100) * 255 / 100
+}
+
+/// Whether any wallpaper mod is switched on, so the desktop needs rebuilding.
+pub fn wallpaper_mods() -> bool {
+    let c = cfg();
+    c.scanlines || c.vignette || c.grain || c.desk_tint > 0
 }
 
 fn flag(key: &str, default: bool) -> bool {
@@ -116,6 +181,26 @@ pub fn load() {
             .unwrap_or_else(default_wallpaper),
         None => default_wallpaper(),
     };
+
+    c.border_width = settings::get_u32("border_width", 0).min(MAX_BORDER);
+    c.border_color = settings::get("border_colour")
+        .and_then(|name| ACCENTS.iter().position(|a| a.0.eq_ignore_ascii_case(&name)))
+        .unwrap_or(0);
+    c.border_focus_only = flag("border_focus_only", true);
+    c.shadow_strength = settings::get_u32("shadow_strength", 100).min(100);
+    c.blur = settings::get_u32("blur", 39).min(100);
+    c.tint = settings::get_u32("tint", 0).min(MAX_TINT);
+    c.focus_glow = flag("focus_glow", false);
+
+    c.dock_magnify = flag("dock_magnify", false);
+    c.dock_hover = flag("dock_hover", true);
+    c.dock_bounce = flag("dock_bounce", true);
+    c.bar_hover = flag("bar_hover", true);
+
+    c.scanlines = flag("scanlines", false);
+    c.vignette = flag("vignette", false);
+    c.grain = flag("grain", false);
+    c.desk_tint = settings::get_u32("desk_tint", 0).min(MAX_DESK_TINT);
 }
 
 /// Write every choice back to disk.
@@ -134,5 +219,23 @@ pub fn save() {
     settings::set("accent", ACCENTS[c.accent.min(ACCENTS.len() - 1)].0);
     let wall = WALLPAPERS.get(c.wallpaper).map(|w| w.name).unwrap_or("Gradient");
     settings::set("wallpaper", wall);
+
+    settings::set("border_width", &format!("{}", c.border_width));
+    settings::set("border_colour", ACCENTS[c.border_color.min(ACCENTS.len() - 1)].0);
+    settings::set("border_focus_only", onoff(c.border_focus_only));
+    settings::set("shadow_strength", &format!("{}", c.shadow_strength));
+    settings::set("blur", &format!("{}", c.blur));
+    settings::set("tint", &format!("{}", c.tint));
+    settings::set("focus_glow", onoff(c.focus_glow));
+
+    settings::set("dock_magnify", onoff(c.dock_magnify));
+    settings::set("dock_hover", onoff(c.dock_hover));
+    settings::set("dock_bounce", onoff(c.dock_bounce));
+    settings::set("bar_hover", onoff(c.bar_hover));
+
+    settings::set("scanlines", onoff(c.scanlines));
+    settings::set("vignette", onoff(c.vignette));
+    settings::set("grain", onoff(c.grain));
+    settings::set("desk_tint", &format!("{}", c.desk_tint));
     settings::flush_quietly();
 }

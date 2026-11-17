@@ -71,6 +71,23 @@ macro_rules! words {
 
 include!(concat!(env!("OUT_DIR"), "/assets_gen.rs"));
 
+/// A full-colour icon, stored at the two sizes the desktop draws.
+pub struct Art {
+    pub name: &'static str,
+    pub s48: Img,
+    pub s64: Img,
+}
+
+/// The app icon whose file is called `name`, if one was dropped into assets/icons/apps.
+pub fn app_art(name: &str) -> Option<&'static Art> {
+    APP_ART.iter().find(|a| a.name.eq_ignore_ascii_case(name))
+}
+
+/// The folder icon whose file is called `name`, if one was dropped into assets/icons/folders.
+pub fn folder_art(name: &str) -> Option<&'static Art> {
+    FOLDER_ART.iter().find(|a| a.name.eq_ignore_ascii_case(name))
+}
+
 pub fn icon16(i: usize) -> &'static Mask {
     &ICONS_16[i]
 }

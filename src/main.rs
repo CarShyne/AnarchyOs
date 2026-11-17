@@ -10,6 +10,7 @@ extern crate alloc;
 
 #[macro_use]
 mod serial;
+mod anarchyai;
 mod arch;
 mod console;
 mod events;
@@ -22,9 +23,14 @@ mod pit;
 mod pmm;
 mod clock;
 mod cpu;
+mod crypto;
+mod files_app;
 mod gfx;
 mod image;
+mod linux;
+mod lock;
 mod net;
+mod netproto;
 mod pci;
 mod ps2;
 mod rtc;
@@ -35,7 +41,9 @@ mod settings_app;
 mod terminal;
 mod theme;
 mod ui;
+mod userspace;
 mod virtio_blk;
+mod volume;
 mod wm;
 
 use alloc::boxed::Box;
@@ -84,19 +92,19 @@ fn main_loop() -> ! {
         // Mouse movement that piled up while the last frame was drawing is
         // added together and handled as one move, so a slow frame makes
         // the pointer jump ahead instead of falling behind.
-        let mut motion: Option<(i32, i32, bool)> = None;
+        let mut motion: Option<(i32, i32, u8)> = None;
         while let Some(ev) = events::pop() {
             match ev {
-                Event::Mouse { dx, dy, left } => {
+                Event::Mouse { dx, dy, buttons } => {
                     motion = match motion {
-                        Some((px, py, held)) if held == left => Some((px + dx, py + dy, left)),
+                        Some((px, py, held)) if held == buttons => Some((px + dx, py + dy, buttons)),
                         Some((px, py, held)) => {
-                            // The button changed, so the earlier movement
+                            // The buttons changed, so the earlier movement
                             // has to land first to keep clicks in place.
                             wm::mouse(px, py, held);
-                            Some((dx, dy, left))
+                            Some((dx, dy, buttons))
                         }
-                        None => Some((dx, dy, left)),
+                        None => Some((dx, dy, buttons)),
                     };
                 }
                 Event::Key(c) => {
@@ -192,8 +200,12 @@ unsafe extern "C" fn kmain() -> ! {
 
     ps2::init();
     if virtio_blk::init(root) {
-        fs::init();
-        settings::load();
+        volume::probe();
+        if volume::is_open() {
+            kprintln!("storage: drive open");
+        } else {
+            kprintln!("storage: drive waiting for a passphrase");
+        }
     } else {
         kprintln!("storage: no virtio disk attached");
     }

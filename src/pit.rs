@@ -19,7 +19,9 @@ extern "x86-interrupt" fn timer_irq(_frame: InterruptStackFrame) {
     let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     pic::eoi(0);
     events::push(Event::Tick(t));
-    sched::preempt();
+    if !crate::userspace::running() {
+        sched::preempt();
+    }
 }
 
 pub fn init() {

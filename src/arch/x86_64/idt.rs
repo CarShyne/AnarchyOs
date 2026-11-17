@@ -83,6 +83,9 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
+    if frame.cs & 3 == 3 {
+        crate::userspace::fault("invalid instruction", 0, &frame);
+    }
     kprintln!("EXCEPTION: invalid opcode (#UD)");
     dump(&frame);
     halt();
@@ -96,6 +99,9 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, error_code: u
 }
 
 extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, error_code: u64) {
+    if frame.cs & 3 == 3 {
+        crate::userspace::fault("general protection fault", error_code, &frame);
+    }
     kprintln!("EXCEPTION: general protection fault (#GP), error code {:#x}", error_code);
     dump(&frame);
     halt();
@@ -104,6 +110,9 @@ extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, error_c
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64) {
     let cr2: u64;
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) };
+    if frame.cs & 3 == 3 {
+        crate::userspace::fault("page fault", cr2, &frame);
+    }
     kprintln!("EXCEPTION: page fault (#PF) at {:#018x}", cr2);
     paging::describe_page_fault(error_code);
     dump(&frame);

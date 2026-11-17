@@ -9,7 +9,7 @@ limine = "0.5"
 font8x8 = { version = "0.3", default-features = false }
 
 [build-dependencies]
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "ico"] }
 fontdue = "0.9"
 
 [profile.dev]

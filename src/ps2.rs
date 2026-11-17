@@ -127,7 +127,7 @@ fn handle_packet(p: [u8; 3]) {
     if flags & 0x20 != 0 {
         dy -= 256;
     }
-    events::push(Event::Mouse { dx, dy, left: flags & 0b001 != 0 });
+    events::push(Event::Mouse { dx, dy, buttons: flags & 0b011 });
 }
 
 extern "x86-interrupt" fn mouse_irq(_frame: InterruptStackFrame) {

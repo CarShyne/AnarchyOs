@@ -3,3 +3,11 @@ build/
 third_party/
 assets/*.bmp
 .DS_Store
+userland/build/
+tools/mkdisk/target/
+
+# Private, not part of the project
+apps/
+"AnarchyAi Blank/"
+"AnarchyAi installer/"
+"Claude outputs/"
